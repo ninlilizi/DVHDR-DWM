@@ -438,18 +438,21 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
     }
 
     float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
+    float3 outc    = lerp(src, encode_from_nits(outNits, ColorSpace), Strength);
 
-    // Black-level lift — raise the floor to BlackLift nits while pulling the
-    // ceiling (MaxCLL) back down by the same amount: an affine remap of
-    // [0, DisplayPeak] -> [BlackLift, DisplayPeak]. Each channel's peak stays
-    // pinned at DisplayPeak so nothing is pushed out of range, the darkest
-    // pixels rise to a faint neutral grey, and being affine (not a ratio) it is
-    // safe on pure-black pixels. For panels that crush detail right at the
+    // Black-level lift — applied as an absolute floor on the FINAL output, after
+    // the Strength crossfade, so nothing (a partial-strength blend back toward
+    // the untouched source, or the dynamic/local-contrast stages above) can sit
+    // below it. Affine remap [0, DisplayPeak] -> [BlackLift, DisplayPeak] in
+    // nits: peak-preserving (per-channel MaxCLL stays at DisplayPeak), the
+    // darkest pixels rise to a faint neutral grey, and being affine (not a
+    // ratio) it is safe on pure black. For panels that crush detail right at the
     // bottom of their range.
     if (BlackLift > 0.0)
-        outNits = BlackLift + outNits * (1.0 - BlackLift / max(DisplayPeak, 1.0));
-
-    float3 outc    = lerp(src, encode_from_nits(outNits, ColorSpace), Strength);
+    {
+        float3 fn = decode_to_nits(outc, ColorSpace);
+        outc = encode_from_nits(BlackLift + fn * (1.0 - BlackLift / max(DisplayPeak, 1.0)), ColorSpace);
+    }
 
     // Overlay mode 2 — fill every presented pixel with a bright HDR red so the
     // user can confirm the write path is reaching the panel independent of any
