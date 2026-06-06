@@ -243,8 +243,9 @@ struct DvhdrKnobs
     float Strength;
     int   AnalyzeStride;
     int   DebugOverlay;
-    float DitherThresholdNits, DitherStrengthNits, DitherGradBoost;
+    float DitherActivity, DitherStrength, DitherFloor;
     float BlackLift;
+    float ShadowToe;
 };
 static DvhdrKnobs g_knobs;
 
@@ -264,12 +265,12 @@ struct DvhdrCbGpu
     float Strength;
     UINT  DebugOverlay;
     UINT  AnalyzeStride;
-    float DitherThresholdNits;
+    float DitherActivity;
 
-    float DitherStrengthNits;
-    float DitherGradBoost;
+    float DitherStrength;
+    float DitherFloor;
     float BlackLift;
-    UINT  _pad1;
+    float ShadowToe;
 };
 static_assert(sizeof(DvhdrCbGpu) == 112, "cbuffer layout drift");
 
@@ -298,6 +299,7 @@ static void LoadKnobsFromIni()
     g_knobs.LiftStrength        = IniFloat("Governor",  "LiftStrength",         0.25f,   path);
     g_knobs.MaxGain             = IniFloat("Governor",  "MaxGain",              1.5f,    path);
     g_knobs.HighlightProtect    = IniFloat("Governor",  "HighlightProtect",     10.0f,   path);
+    g_knobs.ShadowToe           = IniFloat("Governor",  "ShadowToe",            0.25f,   path);
     g_knobs.PeakPercentile      = IniFloat("Governor",  "PeakPercentile",       99.7f,   path);
     g_knobs.AttackMs            = IniFloat("Temporal",  "AttackMs",             80.0f,   path);
     g_knobs.ReleaseMs           = IniFloat("Temporal",  "ReleaseMs",            600.0f,  path);
@@ -309,9 +311,9 @@ static void LoadKnobsFromIni()
     g_knobs.Strength            = IniFloat("ToneCurve", "Strength",             1.0f,    path);
     g_knobs.AnalyzeStride       = GetPrivateProfileIntA("Performance","AnalyzeStride",        2,        path);
     g_knobs.DebugOverlay        = GetPrivateProfileIntA("Debug",      "Overlay",              0,        path);
-    g_knobs.DitherThresholdNits = IniFloat("Dither",    "ThresholdNits",        700.0f,  path);
-    g_knobs.DitherStrengthNits  = IniFloat("Dither",    "StrengthNits",         8.0f,    path);
-    g_knobs.DitherGradBoost     = IniFloat("Dither",    "GradBoost",            2.0f,    path);
+    g_knobs.DitherStrength      = IniFloat("Dither",    "Strength",             1.5f,    path);
+    g_knobs.DitherActivity      = IniFloat("Dither",    "Activity",             0.002f,  path);
+    g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f,    path);
 }
 
 // ===========================================================================
@@ -564,10 +566,11 @@ static void UpdateCbuffer(UINT W, UINT H)
     cb.Strength            = g_knobs.Strength;
     cb.DebugOverlay        = (UINT)g_knobs.DebugOverlay;
     cb.AnalyzeStride       = (g_knobs.AnalyzeStride >= 1) ? (UINT)g_knobs.AnalyzeStride : 1u;
-    cb.DitherThresholdNits = g_knobs.DitherThresholdNits;
-    cb.DitherStrengthNits  = g_knobs.DitherStrengthNits;
-    cb.DitherGradBoost     = g_knobs.DitherGradBoost;
+    cb.DitherActivity      = g_knobs.DitherActivity;
+    cb.DitherStrength      = g_knobs.DitherStrength;
+    cb.DitherFloor         = g_knobs.DitherFloor;
     cb.BlackLift           = g_knobs.BlackLift;
+    cb.ShadowToe           = g_knobs.ShadowToe;
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(g_context->Map(g_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))

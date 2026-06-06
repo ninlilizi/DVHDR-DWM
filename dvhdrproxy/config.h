@@ -17,12 +17,12 @@ struct DvhdrCbGpu
     float Strength;
     UINT  DebugOverlay;
     UINT  AnalyzeStride;
-    float DitherThresholdNits;
+    float DitherActivity;
 
-    float DitherStrengthNits;
-    float DitherGradBoost;
+    float DitherStrength;
+    float DitherFloor;
     float BlackLift;
-    UINT  _pad1;
+    float ShadowToe;
 };
 static_assert(sizeof(DvhdrCbGpu) == 112, "cbuffer layout drift");
 
@@ -38,8 +38,9 @@ struct DvhdrKnobs
     float Strength;
     int   AnalyzeStride;
     int   DebugOverlay;
-    float DitherThresholdNits, DitherStrengthNits, DitherGradBoost;
+    float DitherActivity, DitherStrength, DitherFloor;
     float BlackLift;
+    float ShadowToe;
 };
 
 extern DvhdrKnobs g_knobs;

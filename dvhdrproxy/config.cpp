@@ -39,6 +39,7 @@ void Config_Load()
     g_knobs.LiftStrength        = IniFloat("Governor",  "LiftStrength",         0.25f);
     g_knobs.MaxGain             = IniFloat("Governor",  "MaxGain",              1.5f);
     g_knobs.HighlightProtect    = IniFloat("Governor",  "HighlightProtect",     1.0f);
+    g_knobs.ShadowToe           = IniFloat("Governor",  "ShadowToe",            0.25f);
     g_knobs.PeakPercentile      = IniFloat("Governor",  "PeakPercentile",       99.7f);
     g_knobs.AttackMs            = IniFloat("Temporal",  "AttackMs",             80.0f);
     g_knobs.ReleaseMs           = IniFloat("Temporal",  "ReleaseMs",            600.0f);
@@ -50,9 +51,9 @@ void Config_Load()
     g_knobs.Strength            = IniFloat("ToneCurve", "Strength",             1.0f);
     g_knobs.AnalyzeStride       = GetPrivateProfileIntA("Performance","AnalyzeStride",        2,       g_iniPath);
     g_knobs.DebugOverlay        = GetPrivateProfileIntA("Debug",      "Overlay",              0,       g_iniPath);
-    g_knobs.DitherThresholdNits = IniFloat("Dither",    "ThresholdNits",        600.0f);
-    g_knobs.DitherStrengthNits  = IniFloat("Dither",    "StrengthNits",         20.0f);
-    g_knobs.DitherGradBoost     = IniFloat("Dither",    "GradBoost",            2.0f);
+    g_knobs.DitherStrength      = IniFloat("Dither",    "Strength",             1.5f);
+    g_knobs.DitherActivity      = IniFloat("Dither",    "Activity",             0.002f);
+    g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f);
 }
 
 UINT Config_ColorSpaceForFormat(DXGI_FORMAT fmt)
@@ -96,9 +97,9 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, UINT colorSpace, float f
     cb->Strength            = g_knobs.Strength;
     cb->DebugOverlay        = (UINT)g_knobs.DebugOverlay;
     cb->AnalyzeStride       = (g_knobs.AnalyzeStride >= 1) ? (UINT)g_knobs.AnalyzeStride : 1u;
-    cb->DitherThresholdNits = g_knobs.DitherThresholdNits;
-    cb->DitherStrengthNits  = g_knobs.DitherStrengthNits;
-    cb->DitherGradBoost     = g_knobs.DitherGradBoost;
+    cb->DitherActivity      = g_knobs.DitherActivity;
+    cb->DitherStrength      = g_knobs.DitherStrength;
+    cb->DitherFloor         = g_knobs.DitherFloor;
     cb->BlackLift           = g_knobs.BlackLift;
-    cb->_pad1               = 0;
+    cb->ShadowToe           = g_knobs.ShadowToe;
 }
