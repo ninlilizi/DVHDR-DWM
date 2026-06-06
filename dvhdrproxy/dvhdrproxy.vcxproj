@@ -1,0 +1,144 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>16.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{DA1B7E93-3D8E-4F00-A1B2-DEFA15C8B100}</ProjectGuid>
+    <RootNamespace>dvhdrproxy</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v145</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.props" />
+  </ImportGroup>
+  <ImportGroup Label="Shared" />
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <TargetName>dxgi</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <TargetName>dxgi</TargetName>
+  </PropertyGroup>
+  <PropertyGroup Label="Vcpkg">
+    <VcpkgEnableManifest>true</VcpkgEnableManifest>
+    <VcpkgUseStatic>true</VcpkgUseStatic>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ModuleDefinitionFile>dxgi.def</ModuleDefinitionFile>
+      <AdditionalDependencies>d3d11.lib;d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3d11.dll;d3d12.dll</DelayLoadDLLs>
+      <EnableUAC>false</EnableUAC>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level3</WarningLevel>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;_USRDLL;%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <LanguageStandard>stdcpplatest</LanguageStandard>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <AdditionalIncludeDirectories>$(IntDir);%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+      <ModuleDefinitionFile>dxgi.def</ModuleDefinitionFile>
+      <AdditionalDependencies>d3d11.lib;d3d12.lib;dxgi.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <DelayLoadDLLs>d3d11.dll;d3d12.dll</DelayLoadDLLs>
+      <EnableUAC>false</EnableUAC>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClInclude Include="framework.h" />
+    <ClInclude Include="config.h" />
+    <ClInclude Include="effect_d3d11.h" />
+    <ClInclude Include="effect_d3d12.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="dllmain.cpp" />
+    <ClCompile Include="exports.cpp" />
+    <ClCompile Include="config.cpp" />
+    <ClCompile Include="hook.cpp" />
+    <ClCompile Include="effect_d3d11.cpp" />
+    <ClCompile Include="effect_d3d12.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <MASM Include="forwarders.asm" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="dxgi.def" />
+    <None Include="vcpkg.json" />
+    <None Include="dvhdr.ini" />
+    <CustomBuild Include="..\dvhdr\dvhdr_dwm.hlsl">
+      <FileType>Document</FileType>
+      <Message>Compiling dvhdr_dwm.hlsl -&gt; 7 SM 5.0 bytecode headers (vendored fxc.exe)</Message>
+      <Command>"$(SolutionDir)tools\fxc\fxc.exe" /nologo /O3 /T vs_5_0 /E VS_Post    /Vn g_VS_Post    /Fh "$(IntDir)dvhdr_dwm_vs_post.h"    "%(FullPath)" || exit /b 1
+"$(SolutionDir)tools\fxc\fxc.exe" /nologo /O3 /T ps_5_0 /E PS_BlurH   /Vn g_PS_BlurH   /Fh "$(IntDir)dvhdr_dwm_ps_blurh.h"   "%(FullPath)" || exit /b 1
+"$(SolutionDir)tools\fxc\fxc.exe" /nologo /O3 /T ps_5_0 /E PS_BlurV   /Vn g_PS_BlurV   /Fh "$(IntDir)dvhdr_dwm_ps_blurv.h"   "%(FullPath)" || exit /b 1
+"$(SolutionDir)tools\fxc\fxc.exe" /nologo /O3 /T ps_5_0 /E PS_Tonemap /Vn g_PS_Tonemap /Fh "$(IntDir)dvhdr_dwm_ps_tonemap.h" "%(FullPath)" || exit /b 1
+"$(SolutionDir)tools\fxc\fxc.exe" /nologo /O3 /T cs_5_0 /E CS_Clear   /Vn g_CS_Clear   /Fh "$(IntDir)dvhdr_dwm_cs_clear.h"   "%(FullPath)" || exit /b 1
+"$(SolutionDir)tools\fxc\fxc.exe" /nologo /O3 /T cs_5_0 /E CS_Analyze /Vn g_CS_Analyze /Fh "$(IntDir)dvhdr_dwm_cs_analyze.h" "%(FullPath)" || exit /b 1
+"$(SolutionDir)tools\fxc\fxc.exe" /nologo /O3 /T cs_5_0 /E CS_Adapt   /Vn g_CS_Adapt   /Fh "$(IntDir)dvhdr_dwm_cs_adapt.h"   "%(FullPath)" || exit /b 1</Command>
+      <Outputs>$(IntDir)dvhdr_dwm_vs_post.h;$(IntDir)dvhdr_dwm_ps_blurh.h;$(IntDir)dvhdr_dwm_ps_blurv.h;$(IntDir)dvhdr_dwm_ps_tonemap.h;$(IntDir)dvhdr_dwm_cs_clear.h;$(IntDir)dvhdr_dwm_cs_analyze.h;$(IntDir)dvhdr_dwm_cs_adapt.h</Outputs>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemDefinitionGroup>
+    <PostBuildEvent>
+      <Command>xcopy /Y /D "$(ProjectDir)dvhdr.ini" "$(OutDir)"</Command>
+      <Message>Bundling dvhdr.ini alongside dxgi.dll</Message>
+    </PostBuildEvent>
+  </ItemDefinitionGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+    <Import Project="$(VCTargetsPath)\BuildCustomizations\masm.targets" />
+  </ImportGroup>
+</Project>

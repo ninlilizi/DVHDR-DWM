@@ -4,7 +4,7 @@ Dynamic Dolby-Vision-style HDR tonemapping applied as a full-screen post-FX pass
 inside DWM, so all on-screen content on the targeted display is governed against
 the panel's true MaxFALL and rolled off below its safe luminance ceiling.
 
-Two binaries:
+Three binaries:
 
 - **`dvhdr.dll`** — injected payload. Lives inside `dwm.exe`. Hooks
   `COverlayContext::Present` and runs a six-pass shader (histogram + temporal
@@ -14,6 +14,14 @@ Two binaries:
 - **`dvhdrloader.exe`** — Task-Scheduler-friendly companion. Idempotent: a
   no-args run injects the DLL if absent, no-ops if already present. Run elevated
   (or as SYSTEM from Task Scheduler with highest privileges).
+- **`dxgi.dll`** — ReShade-style per-game proxy. Drop it next to a game's
+  executable and it loads in place of the system `dxgi.dll` (the application
+  directory is searched first), forwards all 20 genuine DXGI exports to
+  `C:\Windows\System32\dxgi.dll`, and hooks `IDXGISwapChain::Present`/`Present1`
+  to run the **same** six-pass shader over the game's own back buffer — D3D11
+  and D3D12. Engages only on HDR back buffers (scRGB FP16 / HDR10 R10G10B10A2);
+  SDR games pass through untouched. Built by the `dvhdrproxy` project; the shader
+  source (`dvhdr_dwm.hlsl`) is shared with the DWM payload, so both stay in step.
 
 The hook scaffolding (AOB scan, DirectFlip suppression, per-monitor keying via
 `DeviceClipBox`) is forked from

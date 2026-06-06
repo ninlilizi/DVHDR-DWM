@@ -74,7 +74,8 @@ cbuffer DVHDRCb : register(b0)
 
     float  DitherStrengthNits;
     float  DitherGradBoost;
-    uint   _pad1, _pad2;
+    float  BlackLift;
+    uint   _pad1;
 };
 
 // ===========================================================================
@@ -437,6 +438,17 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
     }
 
     float3 outNits = lin * (Yt / max(Ysrc, 1e-4));
+
+    // Black-level lift — raise the floor to BlackLift nits while pulling the
+    // ceiling (MaxCLL) back down by the same amount: an affine remap of
+    // [0, DisplayPeak] -> [BlackLift, DisplayPeak]. Each channel's peak stays
+    // pinned at DisplayPeak so nothing is pushed out of range, the darkest
+    // pixels rise to a faint neutral grey, and being affine (not a ratio) it is
+    // safe on pure-black pixels. For panels that crush detail right at the
+    // bottom of their range.
+    if (BlackLift > 0.0)
+        outNits = BlackLift + outNits * (1.0 - BlackLift / max(DisplayPeak, 1.0));
+
     float3 outc    = lerp(src, encode_from_nits(outNits, ColorSpace), Strength);
 
     // Overlay mode 2 — fill every presented pixel with a bright HDR red so the

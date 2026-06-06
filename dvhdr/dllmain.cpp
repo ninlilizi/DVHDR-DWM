@@ -244,6 +244,7 @@ struct DvhdrKnobs
     int   AnalyzeStride;
     int   DebugOverlay;
     float DitherThresholdNits, DitherStrengthNits, DitherGradBoost;
+    float BlackLift;
 };
 static DvhdrKnobs g_knobs;
 
@@ -267,7 +268,8 @@ struct DvhdrCbGpu
 
     float DitherStrengthNits;
     float DitherGradBoost;
-    UINT  _pad1, _pad2;
+    float BlackLift;
+    UINT  _pad1;
 };
 static_assert(sizeof(DvhdrCbGpu) == 112, "cbuffer layout drift");
 
@@ -290,6 +292,7 @@ static void LoadKnobsFromIni()
     g_knobs.DisplayPeak         = IniFloat("Display",   "Peak",                 1300.0f, path);
     g_knobs.DisplayMaxFALL      = IniFloat("Display",   "MaxFALL",              265.0f,  path);
     g_knobs.DisplayBlack        = IniFloat("Display",   "Black",                0.0f,    path);
+    g_knobs.BlackLift           = IniFloat("Display",   "BlackLift",            0.00248f, path);
     g_knobs.HeadroomPercent     = IniFloat("Governor",  "HeadroomPercent",      90.0f,   path);
     g_knobs.MinGain             = IniFloat("Governor",  "MinGain",              0.25f,   path);
     g_knobs.LiftStrength        = IniFloat("Governor",  "LiftStrength",         0.25f,   path);
@@ -564,6 +567,7 @@ static void UpdateCbuffer(UINT W, UINT H)
     cb.DitherThresholdNits = g_knobs.DitherThresholdNits;
     cb.DitherStrengthNits  = g_knobs.DitherStrengthNits;
     cb.DitherGradBoost     = g_knobs.DitherGradBoost;
+    cb.BlackLift           = g_knobs.BlackLift;
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(g_context->Map(g_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
