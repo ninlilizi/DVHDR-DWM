@@ -26,7 +26,7 @@ struct DvhdrCbGpu
 
     float ChromaCorrect;
     float LiftLocality;
-    float _pad1, _pad2;
+    float DebandThreshold, DebandRange;
 };
 static_assert(sizeof(DvhdrCbGpu) == 128, "cbuffer layout drift");
 
@@ -47,6 +47,7 @@ struct DvhdrKnobs
     float ShadowToe;
     float ChromaCorrect;
     float LiftLocality;
+    float DebandThreshold, DebandRange;
 };
 
 extern DvhdrKnobs g_knobs;

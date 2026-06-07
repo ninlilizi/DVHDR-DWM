@@ -79,8 +79,8 @@ cbuffer DVHDRCb : register(b0)
 
     float  ChromaCorrect;   // ICtCp (DICE-style) perceived-saturation preservation, 0..1
     float  LiftLocality;    // 0 = region lift (contrast-preserving), 1 = per-pixel lift
-    float  _pad1;
-    float  _pad2;
+    float  DebandThreshold; // source deband sensitivity, 10-bit PQ code steps; 0 = off
+    float  DebandRange;     // deband sample radius (pixels)
 };
 
 // ===========================================================================
@@ -253,6 +253,45 @@ float3 dice_recombine(float3 linNits, float Ysrc, float Yt, uint csp, float chro
 }
 
 // ===========================================================================
+//  Source debanding — reconstruct quantised gradients before the lift can
+//  amplify them. Per channel in PQ: gather neighbours at two IGN-rotated radii;
+//  where the whole neighbourhood is flat-but-stepped (max deviation below
+//  DebandThreshold code steps) it is a smooth ramp the quantiser shredded, so the
+//  pixel is replaced with the neighbourhood average; where any neighbour deviates
+//  more it is genuine detail / an edge and is kept. The threshold IS the detector.
+// ===========================================================================
+
+float3 src_to_pq(float3 c) { return linear_to_PQ(saturate(decode_to_nits(c, ColorSpace) / 10000.0)); }
+float3 pq_to_src(float3 p) { return encode_from_nits(PQ_to_linear(saturate(p)) * 10000.0, ColorSpace); }
+
+float3 deband_source(float2 uv, float2 pos, float2 ts)
+{
+    float3 c   = src_to_pq(SceneTex.SampleLevel(Samp, uv, 0).rgb);
+    float  thr = DebandThreshold / 1023.0;             // code steps -> PQ
+    float3 sum = c;
+    float3 mx  = float3(0.0, 0.0, 0.0);
+
+    [unroll]
+    for (int i = 1; i <= 2; i++)
+    {
+        float  ang = ign(pos + float2(i * 41.0, i * 23.0)) * 6.2831853;
+        float  r   = DebandRange * (float(i) / 2.0);
+        float2 d   = float2(cos(ang), sin(ang)) * r * ts;
+        float2 q   = float2(-d.y, d.x);                // perpendicular
+        float3 s0 = src_to_pq(SceneTex.SampleLevel(Samp, uv + d, 0).rgb);
+        float3 s1 = src_to_pq(SceneTex.SampleLevel(Samp, uv - d, 0).rgb);
+        float3 s2 = src_to_pq(SceneTex.SampleLevel(Samp, uv + q, 0).rgb);
+        float3 s3 = src_to_pq(SceneTex.SampleLevel(Samp, uv - q, 0).rgb);
+        sum += s0 + s1 + s2 + s3;
+        mx   = max(mx, max(max(abs(s0 - c), abs(s1 - c)), max(abs(s2 - c), abs(s3 - c))));
+    }
+
+    float3 avg = sum / 9.0;
+    float3 t   = saturate(mx / max(thr, 1e-6));        // 0 = flat -> avg, 1 = detail -> keep
+    return pq_to_src(lerp(avg, c, t));
+}
+
+// ===========================================================================
 //  Pass 1 — clear histogram (one workgroup of 256)
 // ===========================================================================
 
@@ -405,7 +444,9 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
     float2 uv  = input.uv;
     int2   px  = int2(input.pos.xy);
 
-    float3 src   = SceneTex.SampleLevel(Samp, uv, 0).rgb;
+    float3 src   = (DebandThreshold > 0.0)
+        ? deband_source(uv, input.pos.xy, float2(1.0 / BufferSize.x, 1.0 / BufferSize.y))
+        : SceneTex.SampleLevel(Samp, uv, 0).rgb;
     float4 ad    = AdaptSRV.Load(int3(0, 0, 0));
     float  adPeak = ad.x;
     float  adFall = ad.y;

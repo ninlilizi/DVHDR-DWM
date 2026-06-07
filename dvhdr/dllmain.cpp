@@ -248,6 +248,7 @@ struct DvhdrKnobs
     float ShadowToe;
     float ChromaCorrect;
     float LiftLocality;
+    float DebandThreshold, DebandRange;
 };
 static DvhdrKnobs g_knobs;
 
@@ -276,7 +277,7 @@ struct DvhdrCbGpu
 
     float ChromaCorrect;
     float LiftLocality;
-    float _pad1, _pad2;
+    float DebandThreshold, DebandRange;
 };
 static_assert(sizeof(DvhdrCbGpu) == 128, "cbuffer layout drift");
 
@@ -322,6 +323,8 @@ static void LoadKnobsFromIni()
     g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f,    path);
     g_knobs.ChromaCorrect       = IniFloat("Color",     "ChromaCorrect",        1.0f,    path);
     g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f,    path);
+    g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            0.0f,    path);
+    g_knobs.DebandRange         = IniFloat("Deband",    "Range",                16.0f,   path);
 }
 
 // ===========================================================================
@@ -581,6 +584,8 @@ static void UpdateCbuffer(UINT W, UINT H)
     cb.ShadowToe           = g_knobs.ShadowToe;
     cb.ChromaCorrect       = g_knobs.ChromaCorrect;
     cb.LiftLocality        = g_knobs.LiftLocality;
+    cb.DebandThreshold     = g_knobs.DebandThreshold;
+    cb.DebandRange         = g_knobs.DebandRange;
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(g_context->Map(g_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))

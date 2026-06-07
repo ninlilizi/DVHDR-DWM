@@ -56,6 +56,8 @@ void Config_Load()
     g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f);
     g_knobs.ChromaCorrect       = IniFloat("Color",     "ChromaCorrect",        1.0f);
     g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f);
+    g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            0.0f);
+    g_knobs.DebandRange         = IniFloat("Deband",    "Range",                16.0f);
 }
 
 UINT Config_ColorSpaceForFormat(DXGI_FORMAT fmt)
@@ -106,4 +108,6 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, UINT colorSpace, float f
     cb->ShadowToe           = g_knobs.ShadowToe;
     cb->ChromaCorrect       = g_knobs.ChromaCorrect;
     cb->LiftLocality        = g_knobs.LiftLocality;
+    cb->DebandThreshold     = g_knobs.DebandThreshold;
+    cb->DebandRange         = g_knobs.DebandRange;
 }
