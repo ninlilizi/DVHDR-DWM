@@ -340,6 +340,16 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, UINT colorSpace)
     g_context->VSSetShader(g_vsPost, NULL, 0);
     g_context->PSSetSamplers(0, 1, &g_sampler);
 
+    // Force a full-frame scissor for the blur passes so the neighbourhood mean
+    // (the lift's base/zone) is computed across the whole frame, rather than
+    // inheriting whatever scissor the game left bound at Present (which could clip
+    // the blur and leave the base black, killing the lift at LiftLocality 0).
+    g_context->RSSetState(g_rasterScissor);
+    {
+        D3D11_RECT fullScissor = { 0, 0, (LONG)bbd.Width, (LONG)bbd.Height };
+        g_context->RSSetScissorRects(1, &fullScissor);
+    }
+
     ID3D11ShaderResourceView* nullSrvs[5] = { NULL, NULL, NULL, NULL, NULL };
 
     g_context->PSSetShaderResources(0, 5, nullSrvs);

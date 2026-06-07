@@ -38,15 +38,15 @@ void Config_Load()
     g_knobs.MinGain             = IniFloat("Governor",  "MinGain",              0.25f);
     g_knobs.LiftStrength        = IniFloat("Governor",  "LiftStrength",         0.25f);
     g_knobs.MaxGain             = IniFloat("Governor",  "MaxGain",              1.5f);
-    g_knobs.HighlightProtect    = IniFloat("Governor",  "HighlightProtect",     1.0f);
+    g_knobs.HighlightProtect    = IniFloat("Governor",  "HighlightProtect",     80.0f);
     g_knobs.ShadowToe           = IniFloat("Governor",  "ShadowToe",            0.25f);
     g_knobs.PeakPercentile      = IniFloat("Governor",  "PeakPercentile",       99.7f);
     g_knobs.AttackMs            = IniFloat("Temporal",  "AttackMs",             80.0f);
     g_knobs.ReleaseMs           = IniFloat("Temporal",  "ReleaseMs",            600.0f);
     g_knobs.DynamicContrast     = IniFloat("ToneCurve", "DynamicContrast",      0.25f);
-    g_knobs.LocalContrast       = IniFloat("ToneCurve", "LocalContrast",        0.35f);
-    g_knobs.LocalContrastRadius = IniFloat("ToneCurve", "LocalContrastRadius",  12.0f);
-    g_knobs.LocalContrastBias   = IniFloat("ToneCurve", "LocalContrastBias",    1.0f);
+    g_knobs.DetailGain          = IniFloat("ToneCurve", "DetailGain",           1.0f);
+    g_knobs.DetailRadius        = IniFloat("ToneCurve", "DetailRadius",         12.0f);
+    g_knobs.DetailBias          = IniFloat("ToneCurve", "DetailBias",           0.0f);
     g_knobs.UseHighlightRolloff = GetPrivateProfileIntA("ToneCurve", "UseHighlightRolloff", 1,       g_iniPath);
     g_knobs.Strength            = IniFloat("ToneCurve", "Strength",             1.0f);
     g_knobs.AnalyzeStride       = GetPrivateProfileIntA("Performance","AnalyzeStride",        2,       g_iniPath);
@@ -54,6 +54,8 @@ void Config_Load()
     g_knobs.DitherStrength      = IniFloat("Dither",    "Strength",             1.5f);
     g_knobs.DitherActivity      = IniFloat("Dither",    "Activity",             0.002f);
     g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f);
+    g_knobs.ChromaCorrect       = IniFloat("Color",     "ChromaCorrect",        1.0f);
+    g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f);
 }
 
 UINT Config_ColorSpaceForFormat(DXGI_FORMAT fmt)
@@ -90,9 +92,9 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, UINT colorSpace, float f
     cb->AttackMs            = g_knobs.AttackMs;
     cb->ReleaseMs           = g_knobs.ReleaseMs;
     cb->DynamicContrast     = g_knobs.DynamicContrast;
-    cb->LocalContrast       = g_knobs.LocalContrast;
-    cb->LocalContrastRadius = g_knobs.LocalContrastRadius;
-    cb->LocalContrastBias   = g_knobs.LocalContrastBias;
+    cb->DetailGain          = g_knobs.DetailGain;
+    cb->DetailRadius        = g_knobs.DetailRadius;
+    cb->DetailBias          = g_knobs.DetailBias;
     cb->UseHighlightRolloff = (g_knobs.UseHighlightRolloff != 0) ? 1u : 0u;
     cb->Strength            = g_knobs.Strength;
     cb->DebugOverlay        = (UINT)g_knobs.DebugOverlay;
@@ -102,4 +104,6 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, UINT colorSpace, float f
     cb->DitherFloor         = g_knobs.DitherFloor;
     cb->BlackLift           = g_knobs.BlackLift;
     cb->ShadowToe           = g_knobs.ShadowToe;
+    cb->ChromaCorrect       = g_knobs.ChromaCorrect;
+    cb->LiftLocality        = g_knobs.LiftLocality;
 }

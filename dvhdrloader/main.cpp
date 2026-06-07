@@ -45,6 +45,22 @@
 
 static bool g_silent = false;
 
+static bool g_attached  = false;  // attached to a parent shell's console
+static bool g_gapOpened = false;
+
+// When attached to a shell's console, our first line would otherwise print on
+// the same row as the prompt. Emit a one-time blank line before the first
+// output, and (via atexit) a matching one after the last, so the run sits
+// cleanly between the surrounding prompts.
+static void CloseOutputGap() { if (g_gapOpened) printf("\n"); }
+static void OpenOutputGap()
+{
+    if (g_silent || !g_attached || g_gapOpened) return;
+    printf("\n");
+    g_gapOpened = true;
+    atexit(CloseOutputGap);
+}
+
 // The loader is built as a Windows-subsystem executable so Task Scheduler runs
 // it in the logged-on session without ever spawning a console window. When it's
 // instead launched from an interactive terminal, attach to that parent console
@@ -53,6 +69,7 @@ static bool g_silent = false;
 static void AttachParentConsole()
 {
     if (!AttachConsole(ATTACH_PARENT_PROCESS)) return;
+    g_attached = true;
     FILE* f;
     freopen_s(&f, "CONOUT$", "w", stdout);
     freopen_s(&f, "CONOUT$", "w", stderr);
@@ -62,6 +79,7 @@ static void AttachParentConsole()
 static void msg(const char* fmt, ...)
 {
     if (g_silent) return;
+    OpenOutputGap();
     va_list ap;
     va_start(ap, fmt);
     vprintf(fmt, ap);
@@ -124,6 +142,7 @@ static std::vector<DisplayInfo> EnumDisplays()
 static void PrintDisplays(const std::vector<DisplayInfo>& ds)
 {
     if (g_silent) return;
+    OpenOutputGap();
     printf("Display  Coords (left,top)   Size           Friendly name\n");
     printf("-------  ------------------  -------------  -------------------\n");
     for (auto& d : ds)
@@ -456,6 +475,7 @@ int main(int argc, char** argv)
         }
         else if (!_stricmp(argv[i], "-h") || !_stricmp(argv[i], "--help"))
         {
+            OpenOutputGap();
             printf("dvhdrloader [--force|--unload|--status|--list] [-m N[,N...]] [-q]\n");
             printf("  (none)        inject dvhdr.dll if absent, otherwise no-op\n");
             printf("  --force       unload + reinject (reloads config)\n");

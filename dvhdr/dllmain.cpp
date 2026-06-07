@@ -238,7 +238,7 @@ struct DvhdrKnobs
     float HeadroomPercent, MinGain, LiftStrength, MaxGain;
     float HighlightProtect, PeakPercentile;
     float AttackMs, ReleaseMs;
-    float DynamicContrast, LocalContrast, LocalContrastRadius, LocalContrastBias;
+    float DynamicContrast, DetailGain, DetailRadius, DetailBias;
     int   UseHighlightRolloff;
     float Strength;
     int   AnalyzeStride;
@@ -246,6 +246,8 @@ struct DvhdrKnobs
     float DitherActivity, DitherStrength, DitherFloor;
     float BlackLift;
     float ShadowToe;
+    float ChromaCorrect;
+    float LiftLocality;
 };
 static DvhdrKnobs g_knobs;
 
@@ -260,7 +262,7 @@ struct DvhdrCbGpu
     float DisplayPeak, DisplayMaxFALL, DisplayBlack, HeadroomPercent;
     float MinGain, LiftStrength, MaxGain, HighlightProtect;
     float PeakPercentile, AttackMs, ReleaseMs, DynamicContrast;
-    float LocalContrast, LocalContrastRadius, LocalContrastBias;
+    float DetailGain, DetailRadius, DetailBias;
     UINT  UseHighlightRolloff;
     float Strength;
     UINT  DebugOverlay;
@@ -271,8 +273,12 @@ struct DvhdrCbGpu
     float DitherFloor;
     float BlackLift;
     float ShadowToe;
+
+    float ChromaCorrect;
+    float LiftLocality;
+    float _pad1, _pad2;
 };
-static_assert(sizeof(DvhdrCbGpu) == 112, "cbuffer layout drift");
+static_assert(sizeof(DvhdrCbGpu) == 128, "cbuffer layout drift");
 
 static float IniFloat(const char* sec, const char* key, float defVal, const char* path)
 {
@@ -298,15 +304,15 @@ static void LoadKnobsFromIni()
     g_knobs.MinGain             = IniFloat("Governor",  "MinGain",              0.25f,   path);
     g_knobs.LiftStrength        = IniFloat("Governor",  "LiftStrength",         0.25f,   path);
     g_knobs.MaxGain             = IniFloat("Governor",  "MaxGain",              1.5f,    path);
-    g_knobs.HighlightProtect    = IniFloat("Governor",  "HighlightProtect",     10.0f,   path);
+    g_knobs.HighlightProtect    = IniFloat("Governor",  "HighlightProtect",     80.0f,   path);
     g_knobs.ShadowToe           = IniFloat("Governor",  "ShadowToe",            0.25f,   path);
     g_knobs.PeakPercentile      = IniFloat("Governor",  "PeakPercentile",       99.7f,   path);
     g_knobs.AttackMs            = IniFloat("Temporal",  "AttackMs",             80.0f,   path);
     g_knobs.ReleaseMs           = IniFloat("Temporal",  "ReleaseMs",            600.0f,  path);
     g_knobs.DynamicContrast     = IniFloat("ToneCurve", "DynamicContrast",      0.1f,    path);
-    g_knobs.LocalContrast       = IniFloat("ToneCurve", "LocalContrast",        0.35f,   path);
-    g_knobs.LocalContrastRadius = IniFloat("ToneCurve", "LocalContrastRadius",  12.0f,   path);
-    g_knobs.LocalContrastBias   = IniFloat("ToneCurve", "LocalContrastBias",    1.0f,    path);
+    g_knobs.DetailGain          = IniFloat("ToneCurve", "DetailGain",           1.0f,    path);
+    g_knobs.DetailRadius        = IniFloat("ToneCurve", "DetailRadius",         12.0f,   path);
+    g_knobs.DetailBias          = IniFloat("ToneCurve", "DetailBias",           0.0f,    path);
     g_knobs.UseHighlightRolloff = GetPrivateProfileIntA("ToneCurve", "UseHighlightRolloff", 1,        path);
     g_knobs.Strength            = IniFloat("ToneCurve", "Strength",             1.0f,    path);
     g_knobs.AnalyzeStride       = GetPrivateProfileIntA("Performance","AnalyzeStride",        2,        path);
@@ -314,6 +320,8 @@ static void LoadKnobsFromIni()
     g_knobs.DitherStrength      = IniFloat("Dither",    "Strength",             1.5f,    path);
     g_knobs.DitherActivity      = IniFloat("Dither",    "Activity",             0.002f,  path);
     g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f,    path);
+    g_knobs.ChromaCorrect       = IniFloat("Color",     "ChromaCorrect",        1.0f,    path);
+    g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f,    path);
 }
 
 // ===========================================================================
@@ -559,9 +567,9 @@ static void UpdateCbuffer(UINT W, UINT H)
     cb.AttackMs            = g_knobs.AttackMs;
     cb.ReleaseMs           = g_knobs.ReleaseMs;
     cb.DynamicContrast     = g_knobs.DynamicContrast;
-    cb.LocalContrast       = g_knobs.LocalContrast;
-    cb.LocalContrastRadius = g_knobs.LocalContrastRadius;
-    cb.LocalContrastBias   = g_knobs.LocalContrastBias;
+    cb.DetailGain          = g_knobs.DetailGain;
+    cb.DetailRadius        = g_knobs.DetailRadius;
+    cb.DetailBias          = g_knobs.DetailBias;
     cb.UseHighlightRolloff = (g_knobs.UseHighlightRolloff != 0) ? 1u : 0u;
     cb.Strength            = g_knobs.Strength;
     cb.DebugOverlay        = (UINT)g_knobs.DebugOverlay;
@@ -571,6 +579,8 @@ static void UpdateCbuffer(UINT W, UINT H)
     cb.DitherFloor         = g_knobs.DitherFloor;
     cb.BlackLift           = g_knobs.BlackLift;
     cb.ShadowToe           = g_knobs.ShadowToe;
+    cb.ChromaCorrect       = g_knobs.ChromaCorrect;
+    cb.LiftLocality        = g_knobs.LiftLocality;
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(g_context->Map(g_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -646,6 +656,17 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
     g_context->IASetInputLayout(NULL);
     g_context->VSSetShader(g_vsPost, NULL, 0);
     g_context->PSSetSamplers(0, 1, &g_sampler);
+
+    // Force a full-frame scissor for the blur passes so the neighbourhood mean
+    // (the lift's base/zone) is computed across the whole frame. Otherwise the
+    // blur inherits whatever scissor DWM left bound at Present, which can clip it
+    // to a stale or empty region — leaving the base black, so the lift vanishes
+    // at LiftLocality 0. The tonemap re-scissors to each dirty rect below.
+    g_context->RSSetState(g_rasterScissor);
+    {
+        D3D11_RECT fullScissor = { 0, 0, (LONG)bbd.Width, (LONG)bbd.Height };
+        g_context->RSSetScissorRects(1, &fullScissor);
+    }
 
     ID3D11ShaderResourceView* nullSrvs[5] = { NULL, NULL, NULL, NULL, NULL };
 

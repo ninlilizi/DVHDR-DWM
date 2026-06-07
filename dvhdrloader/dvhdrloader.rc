@@ -1,0 +1,6 @@
+// dvhdrloader.rc — application resources.
+//
+// The lowest-numbered ICON resource is the one Explorer, the taskbar and the
+// Alt-Tab switcher use to represent the executable.
+
+1 ICON "dvhdrloader.ico"

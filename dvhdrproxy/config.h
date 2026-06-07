@@ -12,7 +12,7 @@ struct DvhdrCbGpu
     float DisplayPeak, DisplayMaxFALL, DisplayBlack, HeadroomPercent;
     float MinGain, LiftStrength, MaxGain, HighlightProtect;
     float PeakPercentile, AttackMs, ReleaseMs, DynamicContrast;
-    float LocalContrast, LocalContrastRadius, LocalContrastBias;
+    float DetailGain, DetailRadius, DetailBias;
     UINT  UseHighlightRolloff;
     float Strength;
     UINT  DebugOverlay;
@@ -23,8 +23,12 @@ struct DvhdrCbGpu
     float DitherFloor;
     float BlackLift;
     float ShadowToe;
+
+    float ChromaCorrect;
+    float LiftLocality;
+    float _pad1, _pad2;
 };
-static_assert(sizeof(DvhdrCbGpu) == 112, "cbuffer layout drift");
+static_assert(sizeof(DvhdrCbGpu) == 128, "cbuffer layout drift");
 
 struct DvhdrKnobs
 {
@@ -33,7 +37,7 @@ struct DvhdrKnobs
     float HeadroomPercent, MinGain, LiftStrength, MaxGain;
     float HighlightProtect, PeakPercentile;
     float AttackMs, ReleaseMs;
-    float DynamicContrast, LocalContrast, LocalContrastRadius, LocalContrastBias;
+    float DynamicContrast, DetailGain, DetailRadius, DetailBias;
     int   UseHighlightRolloff;
     float Strength;
     int   AnalyzeStride;
@@ -41,6 +45,8 @@ struct DvhdrKnobs
     float DitherActivity, DitherStrength, DitherFloor;
     float BlackLift;
     float ShadowToe;
+    float ChromaCorrect;
+    float LiftLocality;
 };
 
 extern DvhdrKnobs g_knobs;

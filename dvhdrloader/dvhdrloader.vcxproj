@@ -99,6 +99,12 @@
   <ItemGroup>
     <None Include="dvhdr.ini" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="dvhdrloader.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <Image Include="dvhdrloader.ico" />
+  </ItemGroup>
   <ItemDefinitionGroup>
     <PostBuildEvent>
       <Command>xcopy /Y /D "$(ProjectDir)dvhdr.ini" "$(OutDir)"</Command>
