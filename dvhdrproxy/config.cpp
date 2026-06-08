@@ -56,7 +56,7 @@ void Config_Load()
     g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f);
     g_knobs.ChromaCorrect       = IniFloat("Color",     "ChromaCorrect",        1.0f);
     g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f);
-    g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            0.0f);
+    g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            3.0f);
     g_knobs.DebandRange         = IniFloat("Deband",    "Range",                16.0f);
 }
 

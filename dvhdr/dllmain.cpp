@@ -323,7 +323,7 @@ static void LoadKnobsFromIni()
     g_knobs.DitherFloor         = IniFloat("Dither",    "Floor",                0.4f,    path);
     g_knobs.ChromaCorrect       = IniFloat("Color",     "ChromaCorrect",        1.0f,    path);
     g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f,    path);
-    g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            0.0f,    path);
+    g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            3.0f,    path);
     g_knobs.DebandRange         = IniFloat("Deband",    "Range",                16.0f,   path);
 }
 
