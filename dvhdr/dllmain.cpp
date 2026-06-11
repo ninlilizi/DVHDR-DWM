@@ -133,7 +133,34 @@ static void* get_relative_address(void* addr, int operand_offset, int instr_size
 // Monitor selection — HKLM\SOFTWARE\DVHDR-DWM\Monitors as REG_MULTI_SZ.
 // ===========================================================================
 
-struct MonitorTarget { int left; int top; };
+// Per-monitor GPU resources. These MUST NOT be shared across screens: the
+// size-bound scene/blur textures have to match each monitor's own back-buffer
+// dimensions (a global set sized grow-only made CopyResource silently fail on a
+// differently-sized screen and painted one monitor's image onto another), and
+// the histogram/adapt state must be independent so each screen adapts to its own
+// content instead of fighting over a shared EMA. qpcLast tracks its own cadence.
+struct PerMonitor
+{
+    UINT W, H;
+    ID3D11Texture2D*             sceneTex;    ID3D11ShaderResourceView*   sceneSRV;
+    ID3D11Texture2D*             lumaHTex;    ID3D11RenderTargetView*     lumaHRTV;     ID3D11ShaderResourceView* lumaHSRV;
+    ID3D11Texture2D*             lumaBlurTex; ID3D11RenderTargetView*     lumaBlurRTV;  ID3D11ShaderResourceView* lumaBlurSRV;
+    ID3D11Texture2D*             histTex;     ID3D11ShaderResourceView*   histSRV;      ID3D11UnorderedAccessView* histUAV;
+    ID3D11Texture2D*             adaptTex;    ID3D11ShaderResourceView*   adaptSRV;     ID3D11UnorderedAccessView* adaptUAV;
+    LARGE_INTEGER               qpcLast;
+};
+
+// A targeted output: its virtual-screen origin (the key DWM hands us per context),
+// the Windows display number that the loader resolved, the panel capabilities
+// resolved for it (each [Display.N] override, falling back to the global
+// [Display]), and that screen's own GPU resource set.
+struct MonitorTarget
+{
+    int   left, top;
+    int   index;                              // Windows display number; -1 if absent
+    float Peak, MaxFALL, Black, BlackLift;    // resolved per-monitor capabilities
+    PerMonitor res;                           // this screen's private pipeline resources
+};
 static std::vector<MonitorTarget> g_targets;
 
 static void LoadTargetsFromRegistry()
@@ -157,8 +184,9 @@ static void LoadTargetsFromRegistry()
     RegCloseKey(key);
     for (const wchar_t* p = buf.data(); *p; p += wcslen(p) + 1)
     {
-        MonitorTarget t;
-        if (swscanf(p, L"%d,%d", &t.left, &t.top) == 2) g_targets.push_back(t);
+        MonitorTarget t = {};
+        t.index = -1;                         // entries may be "left,top" or "left,top,index"
+        if (swscanf(p, L"%d,%d,%d", &t.left, &t.top, &t.index) >= 2) g_targets.push_back(t);
     }
 }
 
@@ -289,12 +317,18 @@ static float IniFloat(const char* sec, const char* key, float defVal, const char
     return (float)atof(buf);
 }
 
+static bool GetIniPath(char* path, size_t cap)
+{
+    DWORD n = GetWindowsDirectoryA(path, (DWORD)cap);
+    if (n == 0 || n + 20 >= cap) return false;
+    strcat(path, "\\Temp\\dvhdr.ini");
+    return true;
+}
+
 static void LoadKnobsFromIni()
 {
     char path[MAX_PATH];
-    DWORD n = GetWindowsDirectoryA(path, MAX_PATH);
-    if (n == 0 || n + 20 >= MAX_PATH) return;
-    strcat(path, "\\Temp\\dvhdr.ini");
+    if (!GetIniPath(path, sizeof(path))) return;
 
     g_knobs.ColorSpace          = GetPrivateProfileIntA("Source",      "ColorSpace",          0,        path);
     g_knobs.DisplayPeak         = IniFloat("Display",   "Peak",                 1300.0f, path);
@@ -327,6 +361,33 @@ static void LoadKnobsFromIni()
     g_knobs.DebandRange         = IniFloat("Deband",    "Range",                16.0f,   path);
 }
 
+// Resolve each target's panel capabilities. Defaults come from the global
+// [Display] (already in g_knobs); a per-monitor [Display.N] section (N = the
+// Windows display number the loader stamped into the registry) overrides any of
+// Peak / MaxFALL / Black / BlackLift for that screen. Must run after both
+// LoadTargetsFromRegistry and LoadKnobsFromIni.
+static void ResolvePerMonitorCaps()
+{
+    char path[MAX_PATH];
+    bool havePath = GetIniPath(path, sizeof(path));
+    for (auto& t : g_targets)
+    {
+        t.Peak      = g_knobs.DisplayPeak;
+        t.MaxFALL   = g_knobs.DisplayMaxFALL;
+        t.Black     = g_knobs.DisplayBlack;
+        t.BlackLift = g_knobs.BlackLift;
+        if (havePath && t.index > 0)
+        {
+            char sec[32];
+            snprintf(sec, sizeof(sec), "Display.%d", t.index);
+            t.Peak      = IniFloat(sec, "Peak",      t.Peak,      path);
+            t.MaxFALL   = IniFloat(sec, "MaxFALL",   t.MaxFALL,   path);
+            t.Black     = IniFloat(sec, "Black",     t.Black,     path);
+            t.BlackLift = IniFloat(sec, "BlackLift", t.BlackLift, path);
+        }
+    }
+}
+
 // ===========================================================================
 // D3D pipeline state — owned by the DLL, recreated on device change.
 // ===========================================================================
@@ -346,47 +407,35 @@ static ID3D11Buffer*        g_cbuffer    = NULL;
 static ID3D11SamplerState*  g_sampler    = NULL;
 static ID3D11RasterizerState* g_rasterScissor = NULL;
 
-static ID3D11Texture2D*     g_histTex    = NULL;
-static ID3D11ShaderResourceView* g_histSRV  = NULL;
-static ID3D11UnorderedAccessView* g_histUAV = NULL;
-
-static ID3D11Texture2D*     g_adaptTex   = NULL;
-static ID3D11ShaderResourceView* g_adaptSRV  = NULL;
-static ID3D11UnorderedAccessView* g_adaptUAV = NULL;
-
-// Back-buffer-size-bound resources.
-static UINT g_sceneW = 0, g_sceneH = 0;
-static ID3D11Texture2D*     g_sceneTex     = NULL;
-static ID3D11ShaderResourceView* g_sceneSRV = NULL;
-static ID3D11Texture2D*     g_lumaHTex     = NULL;
-static ID3D11RenderTargetView*   g_lumaHRTV = NULL;
-static ID3D11ShaderResourceView* g_lumaHSRV = NULL;
-static ID3D11Texture2D*     g_lumaBlurTex     = NULL;
-static ID3D11RenderTargetView*   g_lumaBlurRTV = NULL;
-static ID3D11ShaderResourceView* g_lumaBlurSRV = NULL;
-
-// Frame-time tracker for FrameTimeMs cbuffer field.
+// QueryPerformanceCounter frequency — shared (constant); each monitor keeps its
+// own last-tick in PerMonitor::qpcLast.
 static LARGE_INTEGER g_qpcFreq = {};
-static LARGE_INTEGER g_qpcLast = {};
 
 static bool g_pipelineReady = false;
 
+// Release one screen's private resources (size-bound + histogram/adapt).
+static void FreeMonitorResources(PerMonitor& pm)
+{
+    RELEASE_IF_NOT_NULL(pm.lumaBlurSRV)
+    RELEASE_IF_NOT_NULL(pm.lumaBlurRTV)
+    RELEASE_IF_NOT_NULL(pm.lumaBlurTex)
+    RELEASE_IF_NOT_NULL(pm.lumaHSRV)
+    RELEASE_IF_NOT_NULL(pm.lumaHRTV)
+    RELEASE_IF_NOT_NULL(pm.lumaHTex)
+    RELEASE_IF_NOT_NULL(pm.sceneSRV)
+    RELEASE_IF_NOT_NULL(pm.sceneTex)
+    RELEASE_IF_NOT_NULL(pm.adaptUAV)
+    RELEASE_IF_NOT_NULL(pm.adaptSRV)
+    RELEASE_IF_NOT_NULL(pm.adaptTex)
+    RELEASE_IF_NOT_NULL(pm.histUAV)
+    RELEASE_IF_NOT_NULL(pm.histSRV)
+    RELEASE_IF_NOT_NULL(pm.histTex)
+    pm.W = pm.H = 0;
+}
+
 static void TeardownPipeline()
 {
-    RELEASE_IF_NOT_NULL(g_lumaBlurSRV)
-    RELEASE_IF_NOT_NULL(g_lumaBlurRTV)
-    RELEASE_IF_NOT_NULL(g_lumaBlurTex)
-    RELEASE_IF_NOT_NULL(g_lumaHSRV)
-    RELEASE_IF_NOT_NULL(g_lumaHRTV)
-    RELEASE_IF_NOT_NULL(g_lumaHTex)
-    RELEASE_IF_NOT_NULL(g_sceneSRV)
-    RELEASE_IF_NOT_NULL(g_sceneTex)
-    RELEASE_IF_NOT_NULL(g_adaptUAV)
-    RELEASE_IF_NOT_NULL(g_adaptSRV)
-    RELEASE_IF_NOT_NULL(g_adaptTex)
-    RELEASE_IF_NOT_NULL(g_histUAV)
-    RELEASE_IF_NOT_NULL(g_histSRV)
-    RELEASE_IF_NOT_NULL(g_histTex)
+    for (auto& t : g_targets) FreeMonitorResources(t.res);
     RELEASE_IF_NOT_NULL(g_rasterScissor)
     RELEASE_IF_NOT_NULL(g_sampler)
     RELEASE_IF_NOT_NULL(g_cbuffer)
@@ -397,7 +446,6 @@ static void TeardownPipeline()
     RELEASE_IF_NOT_NULL(g_psBlurV)
     RELEASE_IF_NOT_NULL(g_psBlurH)
     RELEASE_IF_NOT_NULL(g_vsPost)
-    g_sceneW = g_sceneH = 0;
     g_pipelineReady = false;
 }
 
@@ -414,7 +462,6 @@ static void InitDeviceFromDevice(ID3D11Device* dev)
     g_device->AddRef();
     g_device->GetImmediateContext(&g_context);
     QueryPerformanceFrequency(&g_qpcFreq);
-    QueryPerformanceCounter(&g_qpcLast);
 }
 
 // Precompiled SM 5.0 bytecode for every entry point. Generated at build time
@@ -442,7 +489,8 @@ static bool CompileAndCreateShaders()
     return true;
 }
 
-// One-time per-device resources: cbuffer, sampler, histogram, adapt.
+// One-time, truly shared per-device resources: cbuffer, sampler, rasterizer.
+// (Histogram + adapt are per-monitor now — see EnsureMonitorResources.)
 static bool CreateDeviceResources()
 {
     {
@@ -462,33 +510,6 @@ static bool CreateDeviceResources()
         if (FAILED(g_device->CreateSamplerState(&d, &g_sampler))) return false;
     }
     {
-        D3D11_TEXTURE2D_DESC d = {};
-        d.Width = 256; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;
-        d.Format = DXGI_FORMAT_R32_SINT;
-        d.SampleDesc.Count = 1;
-        d.Usage = D3D11_USAGE_DEFAULT;
-        d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        if (FAILED(g_device->CreateTexture2D(&d, NULL, &g_histTex))) return false;
-        if (FAILED(g_device->CreateShaderResourceView(g_histTex, NULL, &g_histSRV))) return false;
-        if (FAILED(g_device->CreateUnorderedAccessView(g_histTex, NULL, &g_histUAV))) return false;
-    }
-    {
-        D3D11_TEXTURE2D_DESC d = {};
-        d.Width = 1; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;
-        d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
-        d.SampleDesc.Count = 1;
-        d.Usage = D3D11_USAGE_DEFAULT;
-        d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
-        if (FAILED(g_device->CreateTexture2D(&d, NULL, &g_adaptTex))) return false;
-        if (FAILED(g_device->CreateShaderResourceView(g_adaptTex, NULL, &g_adaptSRV))) return false;
-        if (FAILED(g_device->CreateUnorderedAccessView(g_adaptTex, NULL, &g_adaptUAV))) return false;
-
-        // Seed adapt with zeros so the first-frame snap in CS_Adapt works.
-        float zero[4] = {0,0,0,0};
-        D3D11_BOX box = { 0,0,0, 1,1,1 };
-        g_context->UpdateSubresource(g_adaptTex, 0, &box, zero, sizeof(zero), sizeof(zero));
-    }
-    {
         // Rasterizer state with scissor enabled — the tonemap pass clips its
         // full-screen triangle to each dirty rect DWM hands us so writes only
         // land in regions that will actually be scanned out.
@@ -502,20 +523,55 @@ static bool CreateDeviceResources()
     return true;
 }
 
-// Size-bound resources — scene copy + ping-pong blur targets. Recreated
-// whenever the back-buffer dimensions grow past the cached size.
-static bool EnsureBackBufferResources(UINT W, UINT H)
+// Ensure one screen's private resources exist and match its back-buffer size.
+// The histogram (256x1) + adapt (1x1) are size-independent and created once;
+// the scene + blur targets are recreated whenever this screen's dimensions
+// change (NOT grow-only — they must match exactly for CopyResource to copy this
+// monitor's pixels rather than silently no-op on a size mismatch).
+static bool EnsureMonitorResources(PerMonitor& pm, UINT W, UINT H)
 {
-    if (W <= g_sceneW && H <= g_sceneH && g_sceneTex && g_lumaHTex && g_lumaBlurTex) return true;
+    if (!pm.histTex)
+    {
+        {
+            D3D11_TEXTURE2D_DESC d = {};
+            d.Width = 256; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;
+            d.Format = DXGI_FORMAT_R32_SINT;
+            d.SampleDesc.Count = 1;
+            d.Usage = D3D11_USAGE_DEFAULT;
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+            if (FAILED(g_device->CreateTexture2D(&d, NULL, &pm.histTex))) return false;
+            if (FAILED(g_device->CreateShaderResourceView(pm.histTex, NULL, &pm.histSRV))) return false;
+            if (FAILED(g_device->CreateUnorderedAccessView(pm.histTex, NULL, &pm.histUAV))) return false;
+        }
+        {
+            D3D11_TEXTURE2D_DESC d = {};
+            d.Width = 1; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;
+            d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            d.SampleDesc.Count = 1;
+            d.Usage = D3D11_USAGE_DEFAULT;
+            d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+            if (FAILED(g_device->CreateTexture2D(&d, NULL, &pm.adaptTex))) return false;
+            if (FAILED(g_device->CreateShaderResourceView(pm.adaptTex, NULL, &pm.adaptSRV))) return false;
+            if (FAILED(g_device->CreateUnorderedAccessView(pm.adaptTex, NULL, &pm.adaptUAV))) return false;
 
-    RELEASE_IF_NOT_NULL(g_lumaBlurSRV)
-    RELEASE_IF_NOT_NULL(g_lumaBlurRTV)
-    RELEASE_IF_NOT_NULL(g_lumaBlurTex)
-    RELEASE_IF_NOT_NULL(g_lumaHSRV)
-    RELEASE_IF_NOT_NULL(g_lumaHRTV)
-    RELEASE_IF_NOT_NULL(g_lumaHTex)
-    RELEASE_IF_NOT_NULL(g_sceneSRV)
-    RELEASE_IF_NOT_NULL(g_sceneTex)
+            // Seed adapt with zeros so the first-frame snap in CS_Adapt works.
+            float zero[4] = {0,0,0,0};
+            D3D11_BOX box = { 0,0,0, 1,1,1 };
+            g_context->UpdateSubresource(pm.adaptTex, 0, &box, zero, sizeof(zero), sizeof(zero));
+        }
+        QueryPerformanceCounter(&pm.qpcLast);
+    }
+
+    if (W == pm.W && H == pm.H && pm.sceneTex && pm.lumaHTex && pm.lumaBlurTex) return true;
+
+    RELEASE_IF_NOT_NULL(pm.lumaBlurSRV)
+    RELEASE_IF_NOT_NULL(pm.lumaBlurRTV)
+    RELEASE_IF_NOT_NULL(pm.lumaBlurTex)
+    RELEASE_IF_NOT_NULL(pm.lumaHSRV)
+    RELEASE_IF_NOT_NULL(pm.lumaHRTV)
+    RELEASE_IF_NOT_NULL(pm.lumaHTex)
+    RELEASE_IF_NOT_NULL(pm.sceneSRV)
+    RELEASE_IF_NOT_NULL(pm.sceneTex)
 
     {
         D3D11_TEXTURE2D_DESC d = {};
@@ -524,8 +580,8 @@ static bool EnsureBackBufferResources(UINT W, UINT H)
         d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        if (FAILED(g_device->CreateTexture2D(&d, NULL, &g_sceneTex))) return false;
-        if (FAILED(g_device->CreateShaderResourceView(g_sceneTex, NULL, &g_sceneSRV))) return false;
+        if (FAILED(g_device->CreateTexture2D(&d, NULL, &pm.sceneTex))) return false;
+        if (FAILED(g_device->CreateShaderResourceView(pm.sceneTex, NULL, &pm.sceneSRV))) return false;
     }
     {
         D3D11_TEXTURE2D_DESC d = {};
@@ -534,33 +590,30 @@ static bool EnsureBackBufferResources(UINT W, UINT H)
         d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-        if (FAILED(g_device->CreateTexture2D(&d, NULL, &g_lumaHTex))) return false;
-        if (FAILED(g_device->CreateRenderTargetView(g_lumaHTex, NULL, &g_lumaHRTV))) return false;
-        if (FAILED(g_device->CreateShaderResourceView(g_lumaHTex, NULL, &g_lumaHSRV))) return false;
-        if (FAILED(g_device->CreateTexture2D(&d, NULL, &g_lumaBlurTex))) return false;
-        if (FAILED(g_device->CreateRenderTargetView(g_lumaBlurTex, NULL, &g_lumaBlurRTV))) return false;
-        if (FAILED(g_device->CreateShaderResourceView(g_lumaBlurTex, NULL, &g_lumaBlurSRV))) return false;
+        if (FAILED(g_device->CreateTexture2D(&d, NULL, &pm.lumaHTex))) return false;
+        if (FAILED(g_device->CreateRenderTargetView(pm.lumaHTex, NULL, &pm.lumaHRTV))) return false;
+        if (FAILED(g_device->CreateShaderResourceView(pm.lumaHTex, NULL, &pm.lumaHSRV))) return false;
+        if (FAILED(g_device->CreateTexture2D(&d, NULL, &pm.lumaBlurTex))) return false;
+        if (FAILED(g_device->CreateRenderTargetView(pm.lumaBlurTex, NULL, &pm.lumaBlurRTV))) return false;
+        if (FAILED(g_device->CreateShaderResourceView(pm.lumaBlurTex, NULL, &pm.lumaBlurSRV))) return false;
     }
-    g_sceneW = W; g_sceneH = H;
+    pm.W = W; pm.H = H;
     return true;
 }
 
-// Populate the cbuffer with the current frame's knob set.
-static void UpdateCbuffer(UINT W, UINT H)
+// Populate the cbuffer with the current frame's knob set. The panel-capability
+// fields come from the per-monitor target when one is supplied (multi-screen),
+// otherwise from the global knobs. frameTimeMs is this screen's own cadence.
+static void UpdateCbuffer(UINT W, UINT H, const MonitorTarget* tgt, float frameTimeMs)
 {
-    LARGE_INTEGER now; QueryPerformanceCounter(&now);
-    double dt = (double)(now.QuadPart - g_qpcLast.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
-    g_qpcLast = now;
-    if (dt > 1000.0 || dt <= 0.0) dt = 16.6; // sanity clamp across long stalls / detours
-
     DvhdrCbGpu cb = {};
     cb.BufferW             = W;
     cb.BufferH             = H;
     cb.ColorSpace          = (g_knobs.ColorSpace == 2) ? 2 : 1; // CSP_HDR10 / CSP_SCRGB
-    cb.FrameTimeMs         = (float)dt;
-    cb.DisplayPeak         = g_knobs.DisplayPeak;
-    cb.DisplayMaxFALL      = g_knobs.DisplayMaxFALL;
-    cb.DisplayBlack        = g_knobs.DisplayBlack;
+    cb.FrameTimeMs         = frameTimeMs;
+    cb.DisplayPeak         = tgt ? tgt->Peak    : g_knobs.DisplayPeak;
+    cb.DisplayMaxFALL      = tgt ? tgt->MaxFALL : g_knobs.DisplayMaxFALL;
+    cb.DisplayBlack        = tgt ? tgt->Black   : g_knobs.DisplayBlack;
     cb.HeadroomPercent     = g_knobs.HeadroomPercent;
     cb.MinGain             = g_knobs.MinGain;
     cb.LiftStrength        = g_knobs.LiftStrength;
@@ -580,7 +633,7 @@ static void UpdateCbuffer(UINT W, UINT H)
     cb.DitherActivity      = g_knobs.DitherActivity;
     cb.DitherStrength      = g_knobs.DitherStrength;
     cb.DitherFloor         = g_knobs.DitherFloor;
-    cb.BlackLift           = g_knobs.BlackLift;
+    cb.BlackLift           = tgt ? tgt->BlackLift : g_knobs.BlackLift;
     cb.ShadowToe           = g_knobs.ShadowToe;
     cb.ChromaCorrect       = g_knobs.ChromaCorrect;
     cb.LiftLocality        = g_knobs.LiftLocality;
@@ -611,17 +664,25 @@ static bool EnsurePipeline()
 // and the local-contrast neighbourhood are scene-wide), but the final
 // tonemap is clipped per dirty rect — DWM only scans out the rectangles in
 // `rects`, and a draw outside them never reaches the panel.
-static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numRects)
+static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numRects,
+                        MonitorTarget* tgt)
 {
-    if (!rects || numRects <= 0) return false;
+    if (!rects || numRects <= 0 || !tgt) return false;
+    PerMonitor& pm = tgt->res;
 
     D3D11_TEXTURE2D_DESC bbd; backBuffer->GetDesc(&bbd);
-    if (!EnsureBackBufferResources(bbd.Width, bbd.Height)) return false;
+    if (!EnsureMonitorResources(pm, bbd.Width, bbd.Height)) return false;
 
-    UpdateCbuffer(bbd.Width, bbd.Height);
+    // This screen's own frame cadence (each monitor presents independently).
+    LARGE_INTEGER now; QueryPerformanceCounter(&now);
+    double dt = (double)(now.QuadPart - pm.qpcLast.QuadPart) * 1000.0 / (double)g_qpcFreq.QuadPart;
+    pm.qpcLast = now;
+    if (dt > 1000.0 || dt <= 0.0) dt = 16.6; // sanity clamp across long stalls / detours
+
+    UpdateCbuffer(bbd.Width, bbd.Height, tgt, (float)dt);
 
     // Snapshot back-buffer → sceneTex (read source for all subsequent passes).
-    g_context->CopyResource(g_sceneTex, backBuffer);
+    g_context->CopyResource(pm.sceneTex, backBuffer);
 
     // Cbuffer is the only persistent binding across all stages.
     g_context->VSSetConstantBuffers(0, 1, &g_cbuffer);
@@ -629,13 +690,13 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
     g_context->CSSetConstantBuffers(0, 1, &g_cbuffer);
 
     // ---- CS_Clear (zero histogram) ----
-    ID3D11UnorderedAccessView* uavs[]   = { g_histUAV, g_adaptUAV };
+    ID3D11UnorderedAccessView* uavs[]   = { pm.histUAV, pm.adaptUAV };
     g_context->CSSetUnorderedAccessViews(0, 2, uavs, NULL);
     g_context->CSSetShader(g_csClear, NULL, 0);
     g_context->Dispatch(1, 1, 1);
 
     // ---- CS_Analyze (histogram accumulate) ----
-    ID3D11ShaderResourceView* csIn[] = { g_sceneSRV };
+    ID3D11ShaderResourceView* csIn[] = { pm.sceneSRV };
     g_context->CSSetShaderResources(0, 1, csIn);
     g_context->CSSetShader(g_csAnalyze, NULL, 0);
     UINT stride = (g_knobs.AnalyzeStride >= 1) ? (UINT)g_knobs.AnalyzeStride : 1u;
@@ -677,16 +738,16 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
 
     // ---- PS_BlurH → LumaH ----
     g_context->PSSetShaderResources(0, 5, nullSrvs);
-    g_context->PSSetShaderResources(0, 1, &g_sceneSRV);
-    g_context->OMSetRenderTargets(1, &g_lumaHRTV, NULL);
+    g_context->PSSetShaderResources(0, 1, &pm.sceneSRV);
+    g_context->OMSetRenderTargets(1, &pm.lumaHRTV, NULL);
     g_context->PSSetShader(g_psBlurH, NULL, 0);
     g_context->Draw(3, 0);
 
     // ---- PS_BlurV → LumaBlur ----
     g_context->OMSetRenderTargets(0, NULL, NULL);
     g_context->PSSetShaderResources(0, 5, nullSrvs);
-    g_context->PSSetShaderResources(3, 1, &g_lumaHSRV);
-    g_context->OMSetRenderTargets(1, &g_lumaBlurRTV, NULL);
+    g_context->PSSetShaderResources(3, 1, &pm.lumaHSRV);
+    g_context->OMSetRenderTargets(1, &pm.lumaBlurRTV, NULL);
     g_context->PSSetShader(g_psBlurV, NULL, 0);
     g_context->Draw(3, 0);
 
@@ -695,7 +756,7 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
     g_context->PSSetShaderResources(0, 5, nullSrvs);
     ID3D11RenderTargetView* bbRTV = NULL;
     if (FAILED(g_device->CreateRenderTargetView(backBuffer, NULL, &bbRTV)) || !bbRTV) return false;
-    ID3D11ShaderResourceView* tmIn[5] = { g_sceneSRV, g_histSRV, g_adaptSRV, NULL, g_lumaBlurSRV };
+    ID3D11ShaderResourceView* tmIn[5] = { pm.sceneSRV, pm.histSRV, pm.adaptSRV, NULL, pm.lumaBlurSRV };
     g_context->PSSetShaderResources(0, 5, tmIn);
     g_context->OMSetRenderTargets(1, &bbRTV, NULL);
     g_context->PSSetShader(g_psTonemap, NULL, 0);
@@ -757,10 +818,11 @@ static bool ApplyDvhdr_SwapChain(void* ctx, IDXGISwapChain* swap, const RECT* re
         if (FAILED(swap->GetBuffer(0, IID_ID3D11Texture2D, (void**)&bb))) return false;
         D3D11_TEXTURE2D_DESC desc; bb->GetDesc(&desc);
         if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) { bb->Release(); return false; }
-        if (!GetTargetForContext(ctx)) { bb->Release(); return false; }
+        MonitorTarget* tgt = GetTargetForContext(ctx);
+        if (!tgt) { bb->Release(); return false; }
         if (!EnsurePipeline()) { bb->Release(); return false; }
 
-        bool ok = RunPipeline(bb, rects, numRects);
+        bool ok = RunPipeline(bb, rects, numRects, tgt);
         bb->Release();
         return ok;
     }
@@ -779,10 +841,11 @@ static bool ApplyDvhdr_Texture(void* ctx, ID3D11Texture2D* bb, const RECT* rects
 
         D3D11_TEXTURE2D_DESC desc; bb->GetDesc(&desc);
         if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) return false;
-        if (!GetTargetForContext(ctx)) return false;
+        MonitorTarget* tgt = GetTargetForContext(ctx);
+        if (!tgt) return false;
         if (!EnsurePipeline()) return false;
 
-        return RunPipeline(bb, rects, numRects);
+        return RunPipeline(bb, rects, numRects, tgt);
     }
     catch (...) { return false; }
 }
@@ -886,23 +949,26 @@ static long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwap
     return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rects, a5, a6, a7);
 }
 
+// These three hooks force DWM composition (no DirectFlip / hardware overlay) so
+// our Present hook can run the pipeline. Gate per-context on the targeted screens
+// only — an untargeted monitor keeps its overlays/MPO untouched.
 static bool COverlayContext_IsCandidateDirectFlipCompatbile_hook(void* self, void* a2, void* a3, void* a4,
                                                                  int a5, unsigned int a6, bool a7, bool a8)
 {
-    if (!g_targets.empty()) return false;
+    if (GetTargetForContext(self)) return false;
     return COverlayContext_IsCandidateDirectFlipCompatbile_orig(self, a2, a3, a4, a5, a6, a7, a8);
 }
 
 static bool COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2(void* self, void* a2, void* a3, void* a4,
                                                                       unsigned int a5, bool a6)
 {
-    if (!g_targets.empty()) return false;
+    if (GetTargetForContext(self)) return false;
     return COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2(self, a2, a3, a4, a5, a6);
 }
 
 static bool COverlayContext_OverlaysEnabled_hook(void* self)
 {
-    if (!g_targets.empty()) return false;
+    if (GetTargetForContext(self)) return false;
     return COverlayContext_OverlaysEnabled_orig(self);
 }
 
@@ -1100,6 +1166,7 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*reserved*/)
 
         LoadTargetsFromRegistry();
         LoadKnobsFromIni();
+        ResolvePerMonitorCaps();
 
         if (!ScanAndHook(dwmcore, mi)) return FALSE;
 

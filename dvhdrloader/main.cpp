@@ -21,8 +21,10 @@
 //      LoadLibraryA, then RevertToSelf.
 //
 // Monitor selection lives in HKLM\SOFTWARE\DVHDR-DWM\Monitors as a
-// REG_MULTI_SZ list of "left,top" strings. The DLL reads it on attach. No
-// side files beside the loader.
+// REG_MULTI_SZ list of "left,top,index" strings. The DLL reads it on attach and
+// matches each DWM context by (left,top); the index lets it pull that screen's
+// per-monitor [Display.N] capability overrides from the ini. No side files
+// beside the loader.
 //
 // Flags:
 //   (none)            inject if absent, exit silently if already present
@@ -31,7 +33,9 @@
 //   --status          report whether dvhdr.dll is currently loaded
 //   --list            enumerate displays with index + coords, exit
 //   -m N[,N,...]      write monitor coords to registry for the given display
-//                     number(s), then force-reinject. Mirrors ApplyIccLut -m.
+//                     number(s), then force-reinject. Several screens may be
+//                     tonemapped at once; each can carry its own capabilities in
+//                     a [Display.N] ini section. Mirrors ApplyIccLut -m.
 //   -q/--silent       suppress console output
 
 #include "pch.h"
@@ -151,14 +155,16 @@ static void PrintDisplays(const std::vector<DisplayInfo>& ds)
                d.friendly.c_str(), d.primary ? " (primary)" : "");
 }
 
-// HKLM\SOFTWARE\DVHDR-DWM\Monitors = REG_MULTI_SZ list of "left,top" strings.
+// HKLM\SOFTWARE\DVHDR-DWM\Monitors = REG_MULTI_SZ list of "left,top,index"
+// strings. The payload matches a DWM context by its (left,top) origin and uses
+// the index to read that screen's [Display.N] capability overrides from the ini.
 static bool WriteMonitorsToRegistry(const std::vector<DisplayInfo>& selected)
 {
     std::vector<wchar_t> buf;
     for (auto& d : selected)
     {
         wchar_t line[64];
-        swprintf_s(line, L"%d,%d", d.left, d.top);
+        swprintf_s(line, L"%d,%d,%d", d.left, d.top, d.index);
         for (wchar_t* p = line; *p; p++) buf.push_back(*p);
         buf.push_back(L'\0');
     }
@@ -482,7 +488,7 @@ int main(int argc, char** argv)
             printf("  --unload      remove dvhdr.dll from dwm.exe\n");
             printf("  --status      report whether dvhdr.dll is currently loaded\n");
             printf("  --list        enumerate displays with index + coords\n");
-            printf("  -m N[,N...]   set HKLM\\SOFTWARE\\DVHDR-DWM\\Monitors for these display numbers, then force-reinject\n");
+            printf("  -m N[,N...]   tonemap these display number(s) (per-screen caps via [Display.N] in the ini), then force-reinject\n");
             printf("  -q/--silent   suppress output (no console window appears regardless)\n");
             return 0;
         }
