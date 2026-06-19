@@ -68,6 +68,28 @@ resolved at solution-open time:
 `dvhdrloader.exe --unload` removes the DLL and deletes the installed files.
 `dvhdrloader.exe --help` lists all flags.
 
+## Idle-screen dimmer
+
+A separate, self-contained feature of the loader — **not** the injected shader —
+for taming light spill from a secondary monitor while you game on another.
+`dvhdrloader.exe --dim 2` starts a persistent watcher (in the user session, no
+injection) that watches Display 2 with the DXGI Desktop Duplication API; when
+nothing changes on it for `IdleSeconds` it gradually fades a transparent,
+click-through black overlay over that screen down to `Level`% brightness, then
+lifts it again quickly when activity returns (a frame update, or the cursor
+moving onto it). Several screens at once: `--dim 2,3`. It dims HDR content
+correctly (a black overlay multiplies the composited picture).
+
+Toggle the whole behaviour on/off at runtime with the global hotkey (default
+`Ctrl+Alt+Shift+D`) **or** by clicking the tray icon — each flip shows a balloon
+notice and beeps so you know it registered. Right-click the tray icon for a menu:
+*Idle dimming* (the same on/off), *Force dim (always on)* — hold the screen dark
+constantly regardless of activity until you turn it off again ("enforce the
+night") — and *Exit*. `dvhdrloader.exe --dim-stop` also stops a running watcher. All timings live in
+the `[Dimmer]` section of `dvhdr.ini` (IdleSeconds, Level, FadeSeconds,
+WakeFadeSeconds, ToggleHotkey, StartEnabled). For persistence, add a second Task
+Scheduler entry running `--dim N` at logon ("only when logged on").
+
 ## Interaction with ApplyIccLut
 
 The two tools operate at independent layers — ApplyIccLut writes
