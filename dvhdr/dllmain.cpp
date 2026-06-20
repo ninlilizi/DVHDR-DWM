@@ -918,16 +918,27 @@ static long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwap
         int n = (int)(rects->end - rects->start);
         if (isWindows11_25h2)
         {
-            ID3D11Texture2D* bb = GetBackBuffer_25H2(overlaySwapChain);
-            if (bb)
+            // Skip hardware-protected (DRM) surfaces — reading one into our
+            // unprotected scene texture yields black, which the tonemap would
+            // then paint over the panel. Matches the legacy/24H2 guard above.
+            bool hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_25h2);
+            if (hwProtected)
             {
-                if (ApplyDvhdr_Texture(self, bb, rects->start, n)) SetActive(self);
-                else                                               UnsetActive(self);
-                bb->Release();
+                UnsetActive(self);
             }
             else
             {
-                UnsetActive(self);
+                ID3D11Texture2D* bb = GetBackBuffer_25H2(overlaySwapChain);
+                if (bb)
+                {
+                    if (ApplyDvhdr_Texture(self, bb, rects->start, n)) SetActive(self);
+                    else                                               UnsetActive(self);
+                    bb->Release();
+                }
+                else
+                {
+                    UnsetActive(self);
+                }
             }
         }
         else // 24H2

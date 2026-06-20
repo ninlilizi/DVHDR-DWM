@@ -491,6 +491,7 @@ static const int  kDimGY        = 54;    //                      points down
 static const int  kDimSampleTol = 6;     // per-point value delta that counts as "changed"
 static const DWORD kDimCheckMs  = 200;   // min interval between pixel comparisons
 static const DWORD kDimSettleMs = 400;   // ignore content changes until alpha is this stable
+static const DWORD kDimTopoSettleMs = 750; // quiet period after the last WM_DISPLAYCHANGE before rebuilding
 
 // Excludes the overlay from screen capture (incl. Desktop Duplication) so its own
 // fade isn't seen as a content change. Defined since Win10 2004; provide a fallback.
@@ -551,7 +552,7 @@ static std::vector<int>    g_dimReq;          // display numbers originally requ
 static bool                g_dimEnabled = true;
 static bool                g_dimForce   = false;     // constant dimming, ignores activity
 static bool                g_dimQuit    = false;
-static bool                g_dimRebuild = false;
+static ULONGLONG           g_dimRebuildAt = 0;       // GetTickCount64 when a settled-topology rebuild is due (0 = none)
 static HWND                g_dimCtrl    = NULL;
 static NOTIFYICONDATAW     g_dimNid     = {};
 static FILE*               g_dimLog     = NULL;
@@ -694,12 +695,17 @@ static bool DimCreateDup(DimMon& m)
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return false;
 
     bool ok = false;
-    IDXGIAdapter1* adapter = NULL;
-    for (UINT ai = 0; !ok && factory->EnumAdapters1(ai, &adapter) != DXGI_ERROR_NOT_FOUND; ai++)
+    for (UINT ai = 0; !ok; ai++)
     {
-        IDXGIOutput* output = NULL;
-        for (UINT oi = 0; !ok && adapter->EnumOutputs(oi, &output) != DXGI_ERROR_NOT_FOUND; oi++)
+        // Stop on the first non-S_OK result (NOT_FOUND, or any transient failure
+        // while the topology is mid-transition) and never enter the body with a
+        // null adapter — EnumAdapters1 can hand one back during a detach.
+        IDXGIAdapter1* adapter = NULL;
+        if (factory->EnumAdapters1(ai, &adapter) != S_OK || !adapter) break;
+        for (UINT oi = 0; !ok; oi++)
         {
+            IDXGIOutput* output = NULL;
+            if (adapter->EnumOutputs(oi, &output) != S_OK || !output) break;
             DXGI_OUTPUT_DESC od = {};
             if (SUCCEEDED(output->GetDesc(&od)) && m.deviceName == od.DeviceName)
             {
@@ -873,6 +879,7 @@ static int DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box)
 // and startup don't false-wake.
 static void DimPoll(DimMon& m, ULONGLONG now)
 {
+    if (g_dimRebuildAt) return;   // topology in flux — touch no DXGI until it settles
     if (!m.dup)
     {
         if (now >= m.nextRetry)
@@ -1035,7 +1042,11 @@ static LRESULT CALLBACK DimWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         DimToggle();
         return 0;
     case WM_DISPLAYCHANGE:                 // topology / resolution change
-        g_dimRebuild = true;
+        // Sleep/wake walks the topology through several stages, each firing this
+        // broadcast. Defer the rebuild until the changes fall quiet (and meanwhile
+        // suspend all capture, below) rather than recreating DXGI devices in the
+        // middle of a detach, which is when the duplication layer is unstable.
+        g_dimRebuildAt = GetTickCount64() + kDimTopoSettleMs;
         return 0;
     case WM_QUERYENDSESSION:
         return TRUE;
@@ -1296,9 +1307,17 @@ static int RunDimmer(const std::vector<int>& indices)
         }
         if (!running || g_dimQuit) break;
 
-        if (g_dimRebuild) { g_dimRebuild = false; DimBuildMons(hinst); }
-
         ULONGLONG now = GetTickCount64();
+
+        if (g_dimRebuildAt)
+        {
+            // A topology change is underway: release every duplication at once so no
+            // capture call lands on an output being detached, and hold off the
+            // rebuild until the broadcasts have been silent for kDimTopoSettleMs.
+            for (auto& m : g_dimMons) DimFreeDup(m);
+            if (now >= g_dimRebuildAt) { g_dimRebuildAt = 0; DimBuildMons(hinst); }
+        }
+
         double dtMs = (double)(now - last);
         last = now;
         if (dtMs <= 0)   dtMs = frameMs;
