@@ -1085,7 +1085,11 @@ static LRESULT CALLBACK DimWndProc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     case WM_DESTROY:
-        PostQuitMessage(0);
+        // Only the control window's destruction ends the program. Overlay windows
+        // share this wndproc and are destroyed/recreated on every topology rebuild
+        // (e.g. monitors detaching on sleep); without this guard an overlay's
+        // WM_DESTROY would post WM_QUIT and silently kill the whole dimmer.
+        if (h == g_dimCtrl) PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(h, msg, wp, lp);
