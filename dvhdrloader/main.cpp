@@ -472,9 +472,12 @@ static bool Unload(HANDLE proc, HMODULE remoteModule)
 // while a frame update (or the cursor moving onto that screen) counts as
 // activity. After IdleSeconds of stillness a transparent, click-through black
 // overlay fades over that monitor down to Level% brightness, restoring quickly
-// when activity resumes. A tray icon and a global hotkey toggle the whole
-// behaviour at runtime, each with a balloon + beep so the change is felt. Knobs
-// come from the [Dimmer] section of the dvhdr.ini beside the loader.
+// when activity resumes. With ContentAware on, change is split by the active
+// window's footprint: when only that window is alive its surroundings dim while
+// it stays carved out and bright, so the chrome rests without darkening what you
+// are watching. A tray icon and a global hotkey toggle the whole behaviour at
+// runtime, each with a balloon + beep so the change is felt. Knobs come from the
+// [Dimmer] section of the dvhdr.ini beside the loader.
 // ===========================================================================
 
 #define DVHDR_DIM_TRAYMSG   (WM_APP + 1)
@@ -492,6 +495,7 @@ static const int  kDimSampleTol = 6;     // per-point value delta that counts as
 static const DWORD kDimCheckMs  = 200;   // min interval between pixel comparisons
 static const DWORD kDimSettleMs = 400;   // ignore content changes until alpha is this stable
 static const DWORD kDimTopoSettleMs = 750; // quiet period after the last WM_DISPLAYCHANGE before rebuilding
+static const DWORD kDimRaiseMs  = 500;   // how often a visible overlay re-pins itself above the taskbar
 
 // Excludes the overlay from screen capture (incl. Desktop Duplication) so its own
 // fade isn't seen as a content change. Defined since Win10 2004; provide a fallback.
@@ -507,6 +511,7 @@ struct DimmerCfg
     double wakeFadeSeconds = 0.3;    // wake-up duration
     double activityPct     = 0.1;    // min screen-% change that counts as activity
     bool   ignoreTaskbar   = true;   // discount changes inside the taskbar
+    bool   contentAware    = true;   // keep the active window lit when only it is changing
     bool   debug           = false;  // write interruptions to a diagnostic log
     bool   startEnabled    = true;
     UINT   hotMods         = 0;      // MOD_* — 0 means no hotkey bound
@@ -544,6 +549,18 @@ struct DimMon
     bool         hasTaskbar   = false;
     int          lastHitCount = 0;       // grid points changed at the last interruption
     RECT         lastHitBox   = {};      // their bounding box, output-local
+    // Content-aware dimming, tracked PER-MONITOR and sticky: this screen's own
+    // content window (carved out and kept lit), independent of which screen holds
+    // the global foreground. lastContentActivity is the timer for change inside it,
+    // kept apart from lastActivity (change in the surroundings, which alone wakes).
+    HWND         activeWnd    = NULL;    // this screen's remembered content window
+    ULONGLONG    lastContentActivity = 0;
+    RECT         activeWinLocal = {};    // its full window rect, output-local (its own zone — never wakes us)
+    RECT         activeLocal  = {};      // its client rect, output-local (the bright hole)
+    bool         hasActive    = false;   // a valid content window currently sits on this screen
+    bool         rgnHasHole   = false;   // whether SetWindowRgn currently cuts a hole
+    RECT         rgnHole      = {};      // the hole last applied (avoids redundant re-cuts)
+    ULONGLONG    lastRaise    = 0;       // last time the visible overlay re-pinned itself top-most
 };
 
 static DimmerCfg           g_dimCfg;
@@ -589,8 +606,9 @@ static void DimOpenLog()
         }
     }
     if (!g_dimLog) g_dimLogPath[0] = '\0';
-    DimLog("dimmer log opened — IdleSeconds=%.0f ActivityThreshold=%.3f%% IgnoreTaskbar=%d",
-           g_dimCfg.idleSeconds, g_dimCfg.activityPct, g_dimCfg.ignoreTaskbar ? 1 : 0);
+    DimLog("dimmer log opened — IdleSeconds=%.0f ActivityThreshold=%.3f%% IgnoreTaskbar=%d ContentAware=%d",
+           g_dimCfg.idleSeconds, g_dimCfg.activityPct, g_dimCfg.ignoreTaskbar ? 1 : 0,
+           g_dimCfg.contentAware ? 1 : 0);
 }
 
 // ---- hotkey string ("Ctrl+Alt+Shift+D") -> MOD_* mask + virtual key ----
@@ -661,6 +679,7 @@ static void LoadDimmerCfg(DimmerCfg& c)
     c.wakeFadeSeconds = F("WakeFadeSeconds",  0.3);
     c.activityPct     = F("ActivityThreshold", 0.1);
     c.ignoreTaskbar   = have ? (GetPrivateProfileIntA("Dimmer", "IgnoreTaskbar", 1, ini) != 0) : true;
+    c.contentAware    = have ? (GetPrivateProfileIntA("Dimmer", "ContentAware", 1, ini) != 0) : true;
     c.debug           = have ? (GetPrivateProfileIntA("Dimmer", "Debug", 0, ini) != 0) : false;
     c.startEnabled    = have ? (GetPrivateProfileIntA("Dimmer", "StartEnabled", 1, ini) != 0) : true;
 
@@ -795,20 +814,86 @@ static UINT DimBytesPerPixel(DXGI_FORMAT f)
     return (f == DXGI_FORMAT_R16G16B16A16_FLOAT) ? 8u : 4u;  // else 8-bpc / R10G10B10A2
 }
 
+// The desktop and the taskbars are not content windows — focusing them must not
+// carve a screen-sized hole, it should let the whole screen dim normally.
+static bool DimIsShellWindow(HWND h)
+{
+    wchar_t cls[64];
+    if (!GetClassNameW(h, cls, ARRAYSIZE(cls))) return false;
+    return !lstrcmpW(cls, L"Progman") || !lstrcmpW(cls, L"WorkerW")
+        || !lstrcmpW(cls, L"Shell_TrayWnd") || !lstrcmpW(cls, L"Shell_SecondaryTrayWnd");
+}
+
+// Resolve THIS monitor's content window — the one carved out and kept lit while
+// its surroundings dim. Tracked per-monitor and STICKY: the global foreground
+// window updates only the monitor whose area holds its centre, so focusing a
+// window on one screen never disturbs another's carve-out. The remembered window
+// persists until it is closed, minimised, or leaves this screen, at which point
+// the screen reverts to a plain full-screen dimmer. Fills m.activeWinLocal (the
+// full window rect — this window's own zone, which must never wake the periphery)
+// and m.activeLocal (the client rect — the bright hole), both output-local.
+static void DimComputeActive(DimMon& m)
+{
+    if (!g_dimCfg.contentAware) { m.hasActive = false; m.activeWnd = NULL; return; }
+
+    // Adopt the foreground window only if its centre lies on this screen, so each
+    // window belongs to exactly one monitor and the others keep what they had.
+    HWND fg = GetForegroundWindow();
+    if (fg && IsWindowVisible(fg) && !DimIsShellWindow(fg))
+    {
+        RECT wr;
+        if (GetWindowRect(fg, &wr))
+        {
+            POINT c = { (wr.left + wr.right) / 2, (wr.top + wr.bottom) / 2 };
+            if (PtInRect(&m.rect, c)) m.activeWnd = fg;
+        }
+    }
+
+    m.hasActive = false;
+    HWND a = m.activeWnd;
+    if (!a || !IsWindow(a) || !IsWindowVisible(a) || IsIconic(a)) { m.activeWnd = NULL; return; }
+
+    RECT wr, wi;
+    if (!GetWindowRect(a, &wr) || !IntersectRect(&wi, &wr, &m.rect)) return;  // gone from this screen
+    if (wi.right - wi.left < 8 || wi.bottom - wi.top < 8) return;
+    m.activeWinLocal = { wi.left - m.rect.left, wi.top - m.rect.top,
+                         wi.right - m.rect.left, wi.bottom - m.rect.top };
+
+    // The bright hole is the client rect; fall back to the window rect if it can't
+    // be resolved, so a window with no usable client area still gets carved out.
+    RECT hole = wi, cr;
+    if (GetClientRect(a, &cr))
+    {
+        POINT tl = { cr.left, cr.top }, br = { cr.right, cr.bottom };
+        ClientToScreen(a, &tl);
+        ClientToScreen(a, &br);
+        RECT cs = { tl.x, tl.y, br.x, br.y }, ci;
+        if (IntersectRect(&ci, &cs, &m.rect)) hole = ci;
+    }
+    m.activeLocal = { hole.left - m.rect.left, hole.top - m.rect.top,
+                      hole.right - m.rect.left, hole.bottom - m.rect.top };
+    m.hasActive = true;
+}
+
 // Copy the captured frame to a CPU-readable staging texture, sample a kDimGX x
 // kDimGY grid of real pixels, and count how many differ from the previous sample
 // by more than kDimSampleTol (skipping the taskbar when IgnoreTaskbar is set).
-// Fills *box with the bounding box of the changed points (output-local). Must be
-// called after AcquireNextFrame and before ReleaseFrame. Returns 0 when it cannot
-// read (so a transient read failure doesn't pin the screen awake) or when this is
-// the first sample after a (re)create (baseline only).
-static int DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box)
+// The count is split: points falling INSIDE the active window's client rect feed
+// *outInside, the rest feed *outOutside, so the caller can tell "only the active
+// window is alive" (dim its surroundings) from "the periphery moved" (wake).
+// *box is the bounding box of the OUTSIDE changes (output-local) — what counts as
+// a wake. Both counts are 0 when it cannot read (a transient failure must not pin
+// the screen awake) or on the first sample after a (re)create (baseline only).
+static void DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box,
+                            int* outInside, int* outOutside)
 {
     if (box) *box = RECT{ 0, 0, 0, 0 };
-    if (!m.ctx) return 0;
+    if (outInside)  *outInside  = 0;
+    if (outOutside) *outOutside = 0;
+    if (!m.ctx) return;
 
     ID3D11Texture2D* tex = NULL;
-    if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) || !tex) return 0;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex)) || !tex) return;
     D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
 
     if (!m.staging || m.stageW != d.Width || m.stageH != d.Height || m.stageFmt != d.Format)
@@ -818,7 +903,7 @@ static int DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box)
         s.Width = d.Width; s.Height = d.Height; s.MipLevels = 1; s.ArraySize = 1;
         s.Format = d.Format; s.SampleDesc.Count = 1;
         s.Usage = D3D11_USAGE_STAGING; s.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-        if (FAILED(m.dev->CreateTexture2D(&s, NULL, &m.staging))) { tex->Release(); return 0; }
+        if (FAILED(m.dev->CreateTexture2D(&s, NULL, &m.staging))) { tex->Release(); return; }
         m.stageW = d.Width; m.stageH = d.Height; m.stageFmt = d.Format;
         m.prevSig.clear();
     }
@@ -827,7 +912,7 @@ static int DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box)
     tex->Release();
 
     D3D11_MAPPED_SUBRESOURCE map;
-    if (FAILED(m.ctx->Map(m.staging, 0, D3D11_MAP_READ, 0, &map))) return 0;
+    if (FAILED(m.ctx->Map(m.staging, 0, D3D11_MAP_READ, 0, &map))) return;
 
     const UINT bpp = DimBytesPerPixel(d.Format);
     std::vector<unsigned char> sig((size_t)kDimGX * kDimGY);
@@ -846,7 +931,7 @@ static int DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box)
     }
     m.ctx->Unmap(m.staging, 0);
 
-    int changed = 0;
+    int inside = 0, outside = 0;
     RECT bb = {};
     if (m.prevSig.size() == sig.size())
     {
@@ -864,14 +949,23 @@ static int DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box)
                     && px >= m.taskbarLocal.left && px < m.taskbarLocal.right
                     && py >= m.taskbarLocal.top  && py < m.taskbarLocal.bottom) continue;
 
-                changed++;
+                if (m.hasActive
+                    && px >= m.activeWinLocal.left && px < m.activeWinLocal.right
+                    && py >= m.activeWinLocal.top  && py < m.activeWinLocal.bottom)
+                {
+                    inside++;   // this window's own frame (incl. title bar) — never a wake
+                    continue;
+                }
+
+                outside++;
                 RECT pr = { px, py, px + 1, py + 1 };
                 DimUnion(bb, pr);
             }
     }
     m.prevSig.swap(sig);
     if (box) *box = bb;
-    return changed;
+    if (outInside)  *outInside  = inside;
+    if (outOutside) *outOutside = outside;
 }
 
 // Poll one monitor's change signal. Never blocks (timeout 0). Recreates a lost
@@ -884,7 +978,7 @@ static void DimPoll(DimMon& m, ULONGLONG now)
     {
         if (now >= m.nextRetry)
         {
-            if (DimCreateDup(m)) { m.lastActivity = now; m.lastPtrValid = false; }
+            if (DimCreateDup(m)) { m.lastActivity = m.lastContentActivity = now; m.lastPtrValid = false; }
             else                 { m.nextRetry = now + 1000; }
         }
         return;
@@ -912,30 +1006,37 @@ static void DimPoll(DimMon& m, ULONGLONG now)
         // Real-pixel content check, throttled — a blinking caret, a ticking clock
         // or an animated icon changes too few grid points to clear the threshold,
         // so it no longer perpetually resets the idle timer (and it is immune to
-        // drivers that mark the whole screen dirty every present).
+        // drivers that mark the whole screen dirty every present). The active
+        // window's footprint is resolved first so the change can be split: motion
+        // INSIDE it keeps that window lit, motion OUTSIDE it is a true wake.
         if (fi.LastPresentTime.QuadPart != 0 && res && now - m.lastCheck >= kDimCheckMs)
         {
             m.lastCheck = now;
+            DimComputeActive(m);
             RECT box = {};
-            int  changed = DimFrameChanged(m, res, &box);   // also refreshes the baseline
-            int  total   = kDimGX * kDimGY;
-            int  thr     = (int)(g_dimCfg.activityPct / 100.0 * total);
+            int  inside = 0, outside = 0;
+            DimFrameChanged(m, res, &box, &inside, &outside);   // also refreshes the baseline
+            int  total = kDimGX * kDimGY;
+            int  thr   = (int)(g_dimCfg.activityPct / 100.0 * total);
             if (thr < 6) thr = 6;
 
-            // Suppress while OUR overlay opacity is still moving (or just settled):
-            // a captured frame mid-fade differs from the last only because of us, so
-            // counting it as activity would cancel the dim it is performing. The
-            // baseline above keeps tracking, so once stable we compare cleanly. The
-            // cursor path below is NOT gated — moving the mouse always wakes it.
+            // Content inside the active window is read through the hole, which is
+            // excluded from capture — so it is never our own fade and needs no settle
+            // gate; refreshing it even mid-fade keeps the hole from blinking shut.
+            if (inside > thr) m.lastContentActivity = now;   // active window alive → hold its hole open
+
+            // The OUTSIDE wake stays gated: a frame captured while our opacity is
+            // still moving differs from the last only because of us, so counting it
+            // would cancel the very dim it is performing.
             bool settled = (now - m.lastAlphaChange) >= kDimSettleMs;
-            if (settled && changed > thr)
+            if (settled && outside > thr)
             {
                 activity = true;
-                m.lastHitCount = changed;
+                m.lastHitCount = outside;
                 m.lastHitBox   = box;
-                DimLog("D%d woke: %d/%d sampled points changed, box (%ld,%ld)-(%ld,%ld)"
+                DimLog("D%d woke: %d/%d points changed outside active win, box (%ld,%ld)-(%ld,%ld)"
                        " [idle was %us]",
-                       m.index, changed, total,
+                       m.index, outside, total,
                        box.left, box.top, box.right, box.bottom,
                        (unsigned)((now - m.lastActivity) / 1000));
             }
@@ -943,14 +1044,23 @@ static void DimPoll(DimMon& m, ULONGLONG now)
         if (fi.LastMouseUpdateTime.QuadPart != 0 && fi.PointerPosition.Visible)
         {
             // Cursor on THIS screen — count only genuine moves, not animated-cursor
-            // shape churn (which also bumps LastMouseUpdateTime). Mouse movement
-            // always wakes the screen, regardless of the content threshold.
+            // shape churn (which also bumps LastMouseUpdateTime). A move over the
+            // active window is content use (keep its hole alive); only a move over
+            // the surroundings wakes the dim.
             POINT p = { fi.PointerPosition.Position.x, fi.PointerPosition.Position.y };
             if (!m.lastPtrValid || p.x != m.lastPtr.x || p.y != m.lastPtr.y)
             {
-                if (!activity)
-                    DimLog("D%d woke: cursor moved to (%ld,%ld)", m.index, p.x, p.y);
-                activity = true;
+                bool overActive = m.hasActive
+                    && p.x >= m.activeWinLocal.left && p.x < m.activeWinLocal.right
+                    && p.y >= m.activeWinLocal.top  && p.y < m.activeWinLocal.bottom;
+                if (overActive)
+                    m.lastContentActivity = now;
+                else
+                {
+                    if (!activity)
+                        DimLog("D%d woke: cursor moved to (%ld,%ld)", m.index, p.x, p.y);
+                    activity = true;
+                }
             }
             m.lastPtr = p;
             m.lastPtrValid = true;
@@ -971,8 +1081,9 @@ static void DimSetTrayTip()
 }
 
 // Live status in the tray tooltip — per monitor: "Dn dim" (overlay down),
-// "Dn 14s" (idle seconds counting toward the threshold), or "Dn no-capture"
-// (Desktop Duplication unavailable, so it cannot be watched). Hover to read it.
+// "Dn dim*" (down, but the active window is carved out and kept lit), "Dn 14s"
+// (idle seconds counting toward the threshold), or "Dn no-capture" (Desktop
+// Duplication unavailable, so it cannot be watched). Hover to read it.
 static void DimStatusTip(ULONGLONG now)
 {
     wchar_t buf[128];
@@ -984,7 +1095,7 @@ static void DimStatusTip(ULONGLONG now)
         if (!m.dup)
             off += wsprintfW(buf + off, L" | D%d no-capture", m.index);
         else if (m.curAlpha > 0.5)
-            off += wsprintfW(buf + off, L" | D%d dim", m.index);
+            off += wsprintfW(buf + off, L" | D%d %s", m.index, m.rgnHasHole ? L"dim*" : L"dim");
         else
         {
             off += wsprintfW(buf + off, L" | D%d %us", m.index,
@@ -1158,7 +1269,7 @@ static void DimBuildMons(HINSTANCE hinst)
         m.rect.right   = found->left + found->width;
         m.rect.bottom  = found->top  + found->height;
         m.deviceName   = found->deviceName;
-        m.lastActivity = GetTickCount64();
+        m.lastActivity = m.lastContentActivity = GetTickCount64();
 
         m.hwnd = CreateWindowExW(
             WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
@@ -1171,12 +1282,48 @@ static void DimBuildMons(HINSTANCE hinst)
             // Keep the overlay out of Desktop Duplication so its own fade isn't
             // mistaken for desktop activity (best-effort; pre-2004 ignores it).
             SetWindowDisplayAffinity(m.hwnd, WDA_EXCLUDEFROMCAPTURE);
+            // Map it now, fully transparent, and leave it mapped for life — only the
+            // opacity animates. A hidden->shown transition at dim time composites one
+            // unclipped frame, flashing the carved window dark before the region bites.
+            ShowWindow(m.hwnd, SW_SHOWNOACTIVATE);
         }
 
         DimCreateDup(m);   // may fail right now; DimPoll retries on a backoff
         g_dimMons.push_back(m);
     }
     DimRefreshTaskbars();
+}
+
+// Carve the active window's client rect out of the overlay (or restore it whole)
+// via the window region. SetWindowRgn takes ownership of the region handle, so a
+// fresh one is built each time — but only when the hole's presence or rectangle
+// actually changes, so a steady idle-dim costs nothing. The cut-out area is not
+// part of the window, so the live content beneath shows at full luminance while
+// the surrounding (in-region) pixels keep the overlay's animated dim alpha.
+static void DimApplyHole(DimMon& m, bool wantHole)
+{
+    if (!m.hwnd) return;
+    RECT hole = wantHole ? m.activeLocal : RECT{ 0, 0, 0, 0 };
+    if (wantHole == m.rgnHasHole && (!wantHole || EqualRect(&hole, &m.rgnHole))) return;
+
+    if (wantHole)
+    {
+        LONG w = m.rect.right - m.rect.left, h = m.rect.bottom - m.rect.top;
+        HRGN rgn = CreateRectRgn(0, 0, w, h);
+        HRGN cut = CreateRectRgn(hole.left, hole.top, hole.right, hole.bottom);
+        CombineRgn(rgn, rgn, cut, RGN_DIFF);
+        DeleteObject(cut);
+        SetWindowRgn(m.hwnd, rgn, TRUE);   // window owns rgn from here
+        DimLog("D%d content-hole open (%ld,%ld)-(%ld,%ld)",
+               m.index, hole.left, hole.top, hole.right, hole.bottom);
+    }
+    else
+    {
+        SetWindowRgn(m.hwnd, NULL, TRUE);
+        if (m.rgnHasHole) DimLog("D%d content-hole closed", m.index);
+    }
+    m.rgnHasHole = wantHole;
+    m.rgnHole    = hole;
 }
 
 // Advance each overlay one tick toward its target opacity.
@@ -1209,12 +1356,36 @@ static void DimTick(ULONGLONG now, double dtMs)
 
         if (m.hwnd)
         {
+            // Content-aware: keep this screen's content window lit while it is alive
+            // (change inside it within the idle window) and carve it out. The region
+            // is maintained continuously — even while the overlay is hidden — so when
+            // the shroud appears the hole is already cut and the window never flashes
+            // dark first. Force-dim stays a full blackout; when nothing inside has
+            // stirred for IdleSeconds the hole closes and the whole screen darkens.
+            double contentIdle = (double)(now - m.lastContentActivity) / 1000.0;
+            bool   holeOpen = g_dimCfg.contentAware && !g_dimForce && m.hasActive
+                              && contentIdle < g_dimCfg.idleSeconds;
+            DimApplyHole(m, holeOpen);
+
             SetLayeredWindowAttributes(m.hwnd, 0, (BYTE)(m.curAlpha + 0.5), LWA_ALPHA);
+            // The overlay stays mapped; only its opacity moves. m.shown now tracks
+            // the logical dim state for the log, not the window's visibility.
             bool want = m.curAlpha > 0.5;
-            if      (want && !m.shown) { ShowWindow(m.hwnd, SW_SHOWNOACTIVATE); m.shown = true;
-                                         DimLog("D%d begins dimming (idle %.0fs)", m.index, idle); }
-            else if (!want && m.shown) { ShowWindow(m.hwnd, SW_HIDE);           m.shown = false;
-                                         DimLog("D%d fully cleared", m.index); }
+            bool justShown = want && !m.shown;
+            if      (justShown)        { m.shown = true;  DimLog("D%d begins dimming (idle %.0fs)", m.index, idle); }
+            else if (!want && m.shown) { m.shown = false; DimLog("D%d fully cleared", m.index); }
+
+            // Re-pin above the per-monitor taskbar, which re-asserts its own top-most
+            // z-order on focus changes and would otherwise float its strip above the
+            // shroud. Done without activating (no flash); on the dim's onset and then
+            // throttled, so we don't wrestle the shell every frame. The carve-out hole
+            // keeps the active window lit even with the overlay above it.
+            if (want && (justShown || now - m.lastRaise >= kDimRaiseMs))
+            {
+                SetWindowPos(m.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                m.lastRaise = now;
+            }
         }
     }
 }
