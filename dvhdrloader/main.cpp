@@ -561,6 +561,13 @@ struct DimMon
     bool         rgnHasHole   = false;   // whether SetWindowRgn currently cuts a hole
     RECT         rgnHole      = {};      // the hole last applied (avoids redundant re-cuts)
     ULONGLONG    lastRaise    = 0;       // last time the visible overlay re-pinned itself top-most
+    // The carve-out is filled by a second, window-confined shroud whose opacity is a
+    // fraction of the surround's. Easing that fraction (holeLit: 0 = matches the
+    // surround, 1 = fully clear) is what lets the window region fade in and out of
+    // the dim instead of snapping when the rest of the screen is already shadowed.
+    HWND         holeWnd      = NULL;    // patch shroud confined to the active window
+    double       holeLit      = 0.0;     // 0..1 clarity of the patch (0 = matches surround)
+    RECT         holePos      = {};      // patch geometry in screen coords (skip redundant moves)
 };
 
 static DimmerCfg           g_dimCfg;
@@ -1210,7 +1217,8 @@ static void DimDestroyMons()
 {
     for (auto& m : g_dimMons)
     {
-        if (m.hwnd) { DestroyWindow(m.hwnd); m.hwnd = NULL; }
+        if (m.hwnd)    { DestroyWindow(m.hwnd);    m.hwnd = NULL; }
+        if (m.holeWnd) { DestroyWindow(m.holeWnd); m.holeWnd = NULL; }
         DimFreeDup(m);
     }
     g_dimMons.clear();
@@ -1288,6 +1296,23 @@ static void DimBuildMons(HINSTANCE hinst)
             ShowWindow(m.hwnd, SW_SHOWNOACTIVATE);
         }
 
+        // The patch shroud that fills the carve-out and fades it in/out. Same style
+        // as the surround and likewise excluded from capture, so its own fade is
+        // never read back as content stirring inside the window (a feedback loop that
+        // would keep the screen perpetually awake). Mapped for life at alpha 0
+        // (invisible); DimTick moves it over the window and animates its opacity.
+        m.holeWnd = CreateWindowExW(
+            WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+            kDimClass, L"", WS_POPUP,
+            m.rect.left, m.rect.top, 1, 1,
+            NULL, NULL, hinst, NULL);
+        if (m.holeWnd)
+        {
+            SetLayeredWindowAttributes(m.holeWnd, 0, 0, LWA_ALPHA);
+            SetWindowDisplayAffinity(m.holeWnd, WDA_EXCLUDEFROMCAPTURE);
+            ShowWindow(m.holeWnd, SW_SHOWNOACTIVATE);
+        }
+
         DimCreateDup(m);   // may fail right now; DimPoll retries on a backoff
         g_dimMons.push_back(m);
     }
@@ -1326,6 +1351,21 @@ static void DimApplyHole(DimMon& m, bool wantHole)
     m.rgnHole    = hole;
 }
 
+// Position the patch shroud over the carved hole (the active window's client rect,
+// in screen coords). Only moves when the rectangle actually changes; its opacity is
+// driven separately each tick. With no carve the patch is left where it sits —
+// DimTick fades its alpha to zero, so it simply vanishes without a move.
+static void DimApplyPatch(DimMon& m, bool carve)
+{
+    if (!m.holeWnd || !carve) return;
+    RECT r = { m.rect.left + m.activeLocal.left,  m.rect.top + m.activeLocal.top,
+               m.rect.left + m.activeLocal.right, m.rect.top + m.activeLocal.bottom };
+    if (EqualRect(&r, &m.holePos)) return;
+    SetWindowPos(m.holeWnd, HWND_TOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    m.holePos = r;
+}
+
 // Advance each overlay one tick toward its target opacity.
 static void DimTick(ULONGLONG now, double dtMs)
 {
@@ -1357,16 +1397,31 @@ static void DimTick(ULONGLONG now, double dtMs)
         if (m.hwnd)
         {
             // Content-aware: keep this screen's content window lit while it is alive
-            // (change inside it within the idle window) and carve it out. The region
-            // is maintained continuously — even while the overlay is hidden — so when
-            // the shroud appears the hole is already cut and the window never flashes
-            // dark first. Force-dim stays a full blackout; when nothing inside has
-            // stirred for IdleSeconds the hole closes and the whole screen darkens.
+            // (change inside it within the idle window). Whenever a content window is
+            // present we carve it out of the surround and fill the gap with the patch
+            // shroud. The patch's dim is a fraction of the surround's — holeLit eases
+            // 0->1 as the window goes lit — so the carve-out melts in and out of the
+            // shadow instead of snapping when the surroundings are already dimmed. At
+            // holeLit 0 the patch exactly equals the surround, so a plain idle screen
+            // still settles as one seamless sheet. Force-dim stays a full blackout.
             double contentIdle = (double)(now - m.lastContentActivity) / 1000.0;
-            bool   holeOpen = g_dimCfg.contentAware && !g_dimForce && m.hasActive
-                              && contentIdle < g_dimCfg.idleSeconds;
-            DimApplyHole(m, holeOpen);
+            bool   carve   = g_dimCfg.contentAware && !g_dimForce && m.hasActive;
+            bool   wantLit = carve && contentIdle < g_dimCfg.idleSeconds;
 
+            double litTarget = wantLit ? 1.0 : 0.0;
+            double litDur    = wantLit ? wakeS : fadeS;   // brighten snappy, settle gently
+            double litStep   = (1.0 / litDur) * (dtMs / 1000.0);
+            if (m.holeLit < litTarget) m.holeLit = (m.holeLit + litStep >= litTarget) ? litTarget : m.holeLit + litStep;
+            else                       m.holeLit = (m.holeLit - litStep <= litTarget) ? litTarget : m.holeLit - litStep;
+
+            DimApplyPatch(m, carve);
+            DimApplyHole(m, carve);
+
+            if (m.holeWnd)
+            {
+                double holeAlpha = carve ? m.curAlpha * (1.0 - m.holeLit) : 0.0;
+                SetLayeredWindowAttributes(m.holeWnd, 0, (BYTE)(holeAlpha + 0.5), LWA_ALPHA);
+            }
             SetLayeredWindowAttributes(m.hwnd, 0, (BYTE)(m.curAlpha + 0.5), LWA_ALPHA);
             // The overlay stays mapped; only its opacity moves. m.shown now tracks
             // the logical dim state for the log, not the window's visibility.
@@ -1384,6 +1439,11 @@ static void DimTick(ULONGLONG now, double dtMs)
             {
                 SetWindowPos(m.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                              SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+                // Pin the patch last so it rides just above the surround, leaving no
+                // seam at the carve-out's edge when both are dimmed.
+                if (m.holeWnd && carve)
+                    SetWindowPos(m.holeWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
                 m.lastRaise = now;
             }
         }
