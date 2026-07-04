@@ -90,6 +90,11 @@ the `[Dimmer]` section of `dvhdr.ini` (IdleSeconds, Level, FadeSeconds,
 WakeFadeSeconds, ToggleHotkey, StartEnabled). For persistence, add a second Task
 Scheduler entry running `--dim N` at logon ("only when logged on").
 
+While SteamVR is running the watcher pauses itself and hides the overlays
+entirely — SteamVR's desktop view cannot click through a layered overlay window,
+even a fully transparent one. Dimming resumes automatically once SteamVR exits;
+set `PauseOnSteamVR = 0` in `[Dimmer]` to opt out.
+
 ## Interaction with ApplyIccLut
 
 The two tools operate at independent layers — ApplyIccLut writes

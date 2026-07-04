@@ -41,7 +41,9 @@
 //                     number(s) and gradually fade a black overlay over each one
 //                     after [Dimmer] IdleSeconds of no on-screen change, lifting
 //                     it again on activity. Toggle at runtime with the [Dimmer]
-//                     ToggleHotkey or the tray icon. See the [Dimmer] ini section.
+//                     ToggleHotkey or the tray icon. Pauses itself (overlays
+//                     hidden) while SteamVR runs, unless [Dimmer] PauseOnSteamVR
+//                     is 0. See the [Dimmer] ini section.
 //   --dim-stop        signal a running --dim watcher to exit
 //   -q/--silent       suppress console output
 
@@ -496,6 +498,7 @@ static const DWORD kDimCheckMs  = 200;   // min interval between pixel compariso
 static const DWORD kDimSettleMs = 400;   // ignore content changes until alpha is this stable
 static const DWORD kDimTopoSettleMs = 750; // quiet period after the last WM_DISPLAYCHANGE before rebuilding
 static const DWORD kDimRaiseMs  = 500;   // how often a visible overlay re-pins itself above the taskbar
+static const DWORD kDimVrScanMs = 2000;  // how often to scan for SteamVR processes
 
 // Excludes the overlay from screen capture (incl. Desktop Duplication) so its own
 // fade isn't seen as a content change. Defined since Win10 2004; provide a fallback.
@@ -512,6 +515,7 @@ struct DimmerCfg
     double activityPct     = 0.1;    // min screen-% change that counts as activity
     bool   ignoreTaskbar   = true;   // discount changes inside the taskbar
     bool   contentAware    = true;   // keep the active window lit when only it is changing
+    bool   pauseOnVr       = true;   // hide the overlays entirely while SteamVR runs
     bool   debug           = false;  // write interruptions to a diagnostic log
     bool   startEnabled    = true;
     UINT   hotMods         = 0;      // MOD_* — 0 means no hotkey bound
@@ -575,6 +579,8 @@ static std::vector<DimMon> g_dimMons;
 static std::vector<int>    g_dimReq;          // display numbers originally requested
 static bool                g_dimEnabled = true;
 static bool                g_dimForce   = false;     // constant dimming, ignores activity
+static bool                g_dimVrPause = false;     // SteamVR alive — overlays hidden
+static ULONGLONG           g_dimNextVrScan = 0;
 static bool                g_dimQuit    = false;
 static ULONGLONG           g_dimRebuildAt = 0;       // GetTickCount64 when a settled-topology rebuild is due (0 = none)
 static HWND                g_dimCtrl    = NULL;
@@ -687,6 +693,7 @@ static void LoadDimmerCfg(DimmerCfg& c)
     c.activityPct     = F("ActivityThreshold", 0.1);
     c.ignoreTaskbar   = have ? (GetPrivateProfileIntA("Dimmer", "IgnoreTaskbar", 1, ini) != 0) : true;
     c.contentAware    = have ? (GetPrivateProfileIntA("Dimmer", "ContentAware", 1, ini) != 0) : true;
+    c.pauseOnVr       = have ? (GetPrivateProfileIntA("Dimmer", "PauseOnSteamVR", 1, ini) != 0) : true;
     c.debug           = have ? (GetPrivateProfileIntA("Dimmer", "Debug", 0, ini) != 0) : false;
     c.startEnabled    = have ? (GetPrivateProfileIntA("Dimmer", "StartEnabled", 1, ini) != 0) : true;
 
@@ -1082,7 +1089,8 @@ static void DimPoll(DimMon& m, ULONGLONG now)
 // ---- tray icon + toggle feedback ----
 static void DimSetTrayTip()
 {
-    wsprintfW(g_dimNid.szTip, L"DVHDR idle-dim: %s", g_dimEnabled ? L"on" : L"off");
+    wsprintfW(g_dimNid.szTip, L"DVHDR idle-dim: %s",
+              g_dimVrPause ? L"paused (SteamVR)" : (g_dimEnabled ? L"on" : L"off"));
     g_dimNid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_dimNid);
 }
@@ -1095,10 +1103,11 @@ static void DimStatusTip(ULONGLONG now)
 {
     wchar_t buf[128];
     int off = wsprintfW(buf, L"DVHDR idle-dim: %s",
-                        g_dimForce ? L"FORCED" : (g_dimEnabled ? L"on" : L"off"));
+                        g_dimVrPause ? L"paused (SteamVR)"
+                                     : (g_dimForce ? L"FORCED" : (g_dimEnabled ? L"on" : L"off")));
     for (auto& m : g_dimMons)
     {
-        if (off > 110) break;
+        if (g_dimVrPause || off > 110) break;
         if (!m.dup)
             off += wsprintfW(buf + off, L" | D%d no-capture", m.index);
         else if (m.curAlpha > 0.5)
@@ -1366,6 +1375,57 @@ static void DimApplyPatch(DimMon& m, bool carve)
     m.holePos = r;
 }
 
+// True while SteamVR is up. vrserver.exe is the runtime's core process and lives
+// for the whole VR session; the compositor and status window are checked as well
+// to cover its start-up and shutdown edges.
+static bool DimSteamVrRunning()
+{
+    static const wchar_t* kVrProcs[] = { L"vrserver.exe", L"vrcompositor.exe", L"vrmonitor.exe" };
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return g_dimVrPause;   // cannot tell — hold current state
+    PROCESSENTRY32W pe = {}; pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            for (auto* n : kVrProcs)
+                if (!_wcsicmp(pe.szExeFile, n)) { found = true; break; }
+        }
+        while (!found && Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
+// Hide or restore every overlay for a VR pause. Hidden outright rather than merely
+// transparent: SteamVR's desktop view cannot click through a layered window at ANY
+// opacity, so while VR runs nothing of ours may sit over the desktop. Re-shown at
+// alpha 0 on resume (the same state they are born in), and the idle timers re-arm
+// so screens count down afresh instead of slamming shut.
+static void DimApplyVrPause()
+{
+    ULONGLONG now = GetTickCount64();
+    for (auto& m : g_dimMons)
+    {
+        m.curAlpha = 0.0;
+        m.holeLit  = 0.0;
+        m.shown    = false;
+        m.lastActivity = m.lastContentActivity = now;
+        if (m.hwnd)
+        {
+            SetLayeredWindowAttributes(m.hwnd, 0, 0, LWA_ALPHA);
+            DimApplyHole(m, false);
+            ShowWindow(m.hwnd, g_dimVrPause ? SW_HIDE : SW_SHOWNOACTIVATE);
+        }
+        if (m.holeWnd)
+        {
+            SetLayeredWindowAttributes(m.holeWnd, 0, 0, LWA_ALPHA);
+            ShowWindow(m.holeWnd, g_dimVrPause ? SW_HIDE : SW_SHOWNOACTIVATE);
+        }
+    }
+}
+
 // Advance each overlay one tick toward its target opacity.
 static void DimTick(ULONGLONG now, double dtMs)
 {
@@ -1550,14 +1610,33 @@ static int RunDimmer(const std::vector<int>& indices)
             // capture call lands on an output being detached, and hold off the
             // rebuild until the broadcasts have been silent for kDimTopoSettleMs.
             for (auto& m : g_dimMons) DimFreeDup(m);
-            if (now >= g_dimRebuildAt) { g_dimRebuildAt = 0; DimBuildMons(hinst); }
+            if (now >= g_dimRebuildAt)
+            {
+                g_dimRebuildAt = 0;
+                DimBuildMons(hinst);
+                if (g_dimVrPause) DimApplyVrPause();   // fresh overlays must stay banished
+            }
+        }
+
+        if (g_dimCfg.pauseOnVr && now >= g_dimNextVrScan)
+        {
+            g_dimNextVrScan = now + kDimVrScanMs;
+            bool vr = DimSteamVrRunning();
+            if (vr != g_dimVrPause)
+            {
+                g_dimVrPause = vr;
+                DimApplyVrPause();
+                DimSetTrayTip();
+                DimLog(vr ? "SteamVR detected — dimming paused, overlays hidden"
+                          : "SteamVR closed — dimming resumed");
+            }
         }
 
         double dtMs = (double)(now - last);
         last = now;
         if (dtMs <= 0)   dtMs = frameMs;
         if (dtMs > 250)  dtMs = 250;     // clamp long stalls so the fade can't jump
-        DimTick(now, dtMs);
+        if (!g_dimVrPause) DimTick(now, dtMs);
 
         if (now - lastTip >= 1000) { lastTip = now; DimRefreshTaskbars(); DimStatusTip(now); }
     }
