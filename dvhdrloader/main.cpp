@@ -41,9 +41,11 @@
 //                     number(s) and gradually fade a black overlay over each one
 //                     after [Dimmer] IdleSeconds of no on-screen change, lifting
 //                     it again on activity. Toggle at runtime with the [Dimmer]
-//                     ToggleHotkey or the tray icon. Pauses itself (overlays
-//                     hidden) while SteamVR runs, unless [Dimmer] PauseOnSteamVR
-//                     is 0. See the [Dimmer] ini section.
+//                     ToggleHotkey or the tray icon. Stands down entirely
+//                     (overlays hidden, capture released) while SteamVR runs
+//                     (unless [Dimmer] PauseOnSteamVR is 0) or while any window
+//                     matching [Dimmer] PauseWindowTitles (e.g. Netflix) is
+//                     visible. See the [Dimmer] ini section.
 //   --dim-stop        signal a running --dim watcher to exit
 //   -q/--silent       suppress console output
 
@@ -54,6 +56,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 
@@ -498,7 +501,7 @@ static const DWORD kDimCheckMs  = 200;   // min interval between pixel compariso
 static const DWORD kDimSettleMs = 400;   // ignore content changes until alpha is this stable
 static const DWORD kDimTopoSettleMs = 750; // quiet period after the last WM_DISPLAYCHANGE before rebuilding
 static const DWORD kDimRaiseMs  = 500;   // how often a visible overlay re-pins itself above the taskbar
-static const DWORD kDimVrScanMs = 2000;  // how often to scan for SteamVR processes
+static const DWORD kDimScanMs   = 2000;  // how often to scan for SteamVR / pause-title windows
 
 // Excludes the overlay from screen capture (incl. Desktop Duplication) so its own
 // fade isn't seen as a content change. Defined since Win10 2004; provide a fallback.
@@ -518,6 +521,9 @@ struct DimmerCfg
     bool   pauseOnVr       = true;   // hide the overlays entirely while SteamVR runs
     bool   debug           = false;  // write interruptions to a diagnostic log
     bool   startEnabled    = true;
+    // Lowercased title substrings; any visible window matching one stands the
+    // whole dimmer down (see DimScanAppPause for why it must be global).
+    std::vector<std::wstring> pauseTitles;
     UINT   hotMods         = 0;      // MOD_* — 0 means no hotkey bound
     UINT   hotVk           = 0;
 };
@@ -540,6 +546,8 @@ struct DimMon
     POINT        lastPtr      = {};
     bool         lastPtrValid = false;
     ULONGLONG    nextRetry    = 0;       // backoff before re-creating a lost dup
+    DWORD        retryDelay   = 500;     // recreate backoff (ms) — doubles when sessions die young
+    ULONGLONG    dupBornAt    = 0;       // when the current duplication was created
     double       curAlpha     = 0.0;     // 0..255, the animated overlay opacity
     ULONGLONG    lastAlphaChange = 0;    // when curAlpha last moved (self-change guard)
     bool         shown        = false;
@@ -565,6 +573,8 @@ struct DimMon
     bool         rgnHasHole   = false;   // whether SetWindowRgn currently cuts a hole
     RECT         rgnHole      = {};      // the hole last applied (avoids redundant re-cuts)
     ULONGLONG    lastRaise    = 0;       // last time the visible overlay re-pinned itself top-most
+    int          lastSurfAlpha = -1;     // last alpha actually applied to hwnd (skip no-op pokes)
+    int          lastHoleAlpha = -1;     // last alpha actually applied to holeWnd
     // The carve-out is filled by a second, window-confined shroud whose opacity is a
     // fraction of the surround's. Easing that fraction (holeLit: 0 = matches the
     // surround, 1 = fully clear) is what lets the window region fade in and out of
@@ -579,8 +589,9 @@ static std::vector<DimMon> g_dimMons;
 static std::vector<int>    g_dimReq;          // display numbers originally requested
 static bool                g_dimEnabled = true;
 static bool                g_dimForce   = false;     // constant dimming, ignores activity
-static bool                g_dimVrPause = false;     // SteamVR alive — overlays hidden
-static ULONGLONG           g_dimNextVrScan = 0;
+static bool                g_dimVrPause  = false;    // SteamVR alive — dimmer stood down
+static bool                g_dimAppPause = false;    // a pause-title window is visible — stood down
+static ULONGLONG           g_dimNextScan = 0;        // next SteamVR / pause-title sweep
 static bool                g_dimQuit    = false;
 static ULONGLONG           g_dimRebuildAt = 0;       // GetTickCount64 when a settled-topology rebuild is due (0 = none)
 static HWND                g_dimCtrl    = NULL;
@@ -702,6 +713,22 @@ static void LoadDimmerCfg(DimmerCfg& c)
     else      strcpy(hk, "Ctrl+Alt+Shift+D");
     DimParseHotkey(hk, c.hotMods, c.hotVk);
 
+    char pt[512];
+    if (have) GetPrivateProfileStringA("Dimmer", "PauseWindowTitles", "Netflix", pt, sizeof(pt), ini);
+    else      strcpy(pt, "Netflix");
+    c.pauseTitles.clear();
+    for (char* tok = strtok(pt, ",;"); tok; tok = strtok(NULL, ",;"))
+    {
+        while (*tok == ' ' || *tok == '\t') tok++;
+        char* end = tok + strlen(tok);
+        while (end > tok && (end[-1] == ' ' || end[-1] == '\t')) *--end = '\0';
+        if (!*tok) continue;
+        wchar_t w[128] = {};
+        MultiByteToWideChar(CP_ACP, 0, tok, -1, w, ARRAYSIZE(w) - 1);
+        CharLowerW(w);
+        c.pauseTitles.push_back(w);
+    }
+
     if (c.level < 0)              c.level = 0;
     if (c.level > 100)            c.level = 100;
     if (c.idleSeconds < 1)        c.idleSeconds = 1;
@@ -784,6 +811,7 @@ static bool DimCreateDup(DimMon& m)
                         m.ctx = ctx; ctx = NULL;   // kept for CopyResource + Map
                         m.dup = dup;
                         m.primed = false;
+                        m.dupBornAt = GetTickCount64();
                         ok = true;
                     }
                     if (ctx) ctx->Release();
@@ -988,12 +1016,37 @@ static void DimFrameChanged(DimMon& m, IDXGIResource* res, RECT* box,
 static void DimPoll(DimMon& m, ULONGLONG now)
 {
     if (g_dimRebuildAt) return;   // topology in flux — touch no DXGI until it settles
+
+    // Capture only while the idle rule is actually judging this screen — toggled
+    // off and force-dim (dark regardless) both decide without it. Releasing the
+    // session then is more than thrift: an open duplication forces the compositor
+    // off MPO overlay scanout, and on some driver/monitor pairings that
+    // transition blanks the whole display for seconds — so capture must not
+    // merely idle, it must not exist.
+    if (!g_dimEnabled || g_dimForce)
+    {
+        if (m.dup) { DimFreeDup(m); DimLog("D%d capture released (not judging)", m.index); }
+        m.nextRetry = 0;
+        return;
+    }
+
     if (!m.dup)
     {
         if (now >= m.nextRetry)
         {
-            if (DimCreateDup(m)) { m.lastActivity = m.lastContentActivity = now; m.lastPtrValid = false; }
-            else                 { m.nextRetry = now + 1000; }
+            if (DimCreateDup(m))
+            {
+                m.lastActivity = m.lastContentActivity = now;
+                m.lastPtrValid = false;
+                DimLog("D%d duplication created", m.index);
+            }
+            else
+            {
+                m.retryDelay = m.retryDelay >= 7500 ? 15000 : m.retryDelay * 2;
+                m.nextRetry  = now + m.retryDelay;
+                DimLog("D%d duplication create failed (0x%08X) — next attempt in %lums",
+                       m.index, (unsigned)m.lastDupHr, m.retryDelay);
+            }
         }
         return;
     }
@@ -1004,8 +1057,16 @@ static void DimPoll(DimMon& m, ULONGLONG now)
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) return;   // nothing changed; no frame held
     if (FAILED(hr))                               // ACCESS_LOST / DENIED / unavailable
     {
+        // A session that died young means something is repeatedly tearing capture
+        // down (protected-content transitions, fullscreen flips, another grabber).
+        // Every recreate cycles the compositor's scanout path — the very thing
+        // that can blank the monitor — so back off instead of thrashing at 2 Hz.
+        bool young = (now - m.dupBornAt) < 30000;
+        m.retryDelay = young ? (m.retryDelay >= 7500 ? 15000 : m.retryDelay * 2) : 500;
+        DimLog("D%d duplication lost (0x%08X) after %llus — recreate in %lums",
+               m.index, (unsigned)hr, (now - m.dupBornAt) / 1000, m.retryDelay);
         DimFreeDup(m);
-        m.nextRetry = now + 500;
+        m.nextRetry = now + m.retryDelay;
         return;
     }
 
@@ -1090,7 +1151,8 @@ static void DimPoll(DimMon& m, ULONGLONG now)
 static void DimSetTrayTip()
 {
     wsprintfW(g_dimNid.szTip, L"DVHDR idle-dim: %s",
-              g_dimVrPause ? L"paused (SteamVR)" : (g_dimEnabled ? L"on" : L"off"));
+              g_dimVrPause  ? L"paused (SteamVR)" :
+              g_dimAppPause ? L"paused (app)"     : (g_dimEnabled ? L"on" : L"off"));
     g_dimNid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_dimNid);
 }
@@ -1103,15 +1165,20 @@ static void DimStatusTip(ULONGLONG now)
 {
     wchar_t buf[128];
     int off = wsprintfW(buf, L"DVHDR idle-dim: %s",
-                        g_dimVrPause ? L"paused (SteamVR)"
-                                     : (g_dimForce ? L"FORCED" : (g_dimEnabled ? L"on" : L"off")));
+                        g_dimVrPause  ? L"paused (SteamVR)" :
+                        g_dimAppPause ? L"paused (app)"
+                                      : (g_dimForce ? L"FORCED" : (g_dimEnabled ? L"on" : L"off")));
+    // Per-monitor detail only while screens are actually being judged — when the
+    // dimmer is off or stood down, capture is deliberately released and idle
+    // counts are meaningless (a bare "no-capture" would read as a fault).
+    bool judging = !g_dimVrPause && !g_dimAppPause && (g_dimEnabled || g_dimForce);
     for (auto& m : g_dimMons)
     {
-        if (g_dimVrPause || off > 110) break;
-        if (!m.dup)
-            off += wsprintfW(buf + off, L" | D%d no-capture", m.index);
-        else if (m.curAlpha > 0.5)
+        if (!judging || off > 110) break;
+        if (m.curAlpha > 0.5)
             off += wsprintfW(buf + off, L" | D%d %s", m.index, m.rgnHasHole ? L"dim*" : L"dim");
+        else if (!m.dup && !g_dimForce)
+            off += wsprintfW(buf + off, L" | D%d no-capture", m.index);
         else
         {
             off += wsprintfW(buf + off, L" | D%d %us", m.index,
@@ -1136,11 +1203,13 @@ static void DimBalloon(const wchar_t* text)
     Shell_NotifyIconW(NIM_MODIFY, &n);
 }
 
+static bool DimOverlaysShouldHide();
+static void DimApplyOverlayHide(bool hide);
+
 static void DimToggle()
 {
     g_dimEnabled = !g_dimEnabled;
-    ULONGLONG now = GetTickCount64();
-    for (auto& m : g_dimMons) m.lastActivity = now;   // re-arm idle on either flip
+    DimApplyOverlayHide(DimOverlaysShouldHide());   // also re-arms the idle timers
     DimSetTrayTip();
     DimBalloon(g_dimEnabled ? L"Idle dimming enabled" : L"Idle dimming disabled");
     MessageBeep(g_dimEnabled ? MB_OK : MB_ICONASTERISK);
@@ -1152,8 +1221,7 @@ static void DimToggle()
 static void DimToggleForce()
 {
     g_dimForce = !g_dimForce;
-    ULONGLONG now = GetTickCount64();
-    for (auto& m : g_dimMons) m.lastActivity = now;   // so it re-evaluates cleanly when lifted
+    DimApplyOverlayHide(DimOverlaysShouldHide());   // also re-arms the idle timers
     DimSetTrayTip();
     DimBalloon(g_dimForce ? L"Constant dimming ON — screen held dark until you turn it off"
                           : L"Constant dimming off");
@@ -1322,7 +1390,11 @@ static void DimBuildMons(HINSTANCE hinst)
             ShowWindow(m.holeWnd, SW_SHOWNOACTIVATE);
         }
 
-        DimCreateDup(m);   // may fail right now; DimPoll retries on a backoff
+        // No capture while everything is stood down — creating a duplication only
+        // to free it moments later cycles the compositor's scanout path for
+        // nothing. DimPoll creates it (with retry backoff) once judging resumes.
+        if (!DimOverlaysShouldHide())
+            DimCreateDup(m);   // may fail right now; DimPoll retries on a backoff
         g_dimMons.push_back(m);
     }
     DimRefreshTaskbars();
@@ -1398,32 +1470,101 @@ static bool DimSteamVrRunning()
     return found;
 }
 
-// Hide or restore every overlay for a VR pause. Hidden outright rather than merely
-// transparent: SteamVR's desktop view cannot click through a layered window at ANY
-// opacity, so while VR runs nothing of ours may sit over the desktop. Re-shown at
-// alpha 0 on resume (the same state they are born in), and the idle timers re-arm
-// so screens count down afresh instead of slamming shut.
-static void DimApplyVrPause()
+// True while nothing may dim at all: SteamVR alive, a pause-title window (e.g.
+// Netflix) visible, or idle dimming toggled off with no force-dim in effect. The
+// dimmer then stands down COMPLETELY — overlays hidden, capture released, tick
+// loop skipped. Hidden outright rather than left transparent: SteamVR's desktop
+// view cannot click through a layered window at ANY opacity, and during DRM
+// playback both an open duplication (which forces MPO off globally) and a
+// capture-excluded window over the video can blank entire panels for seconds
+// while the protected path renegotiates — as observed, on EVERY monitor, not
+// just the one carrying the film. That is why a pause-title window stands the
+// whole dimmer down rather than merely its own display.
+static bool DimOverlaysShouldHide()
+{
+    return g_dimVrPause || g_dimAppPause || (!g_dimEnabled && !g_dimForce);
+}
+
+// Hide or restore ONE monitor's overlays. Hidden means truly stood down: alpha
+// zeroed, region restored, windows unmapped and capture released — over DRM
+// video (a held Netflix screen) even an invisible capture-excluded window, let
+// alone a duplication session, can push the protected-playback path off its
+// hardware overlay and blank the panel while it renegotiates. Re-shown at alpha
+// 0 (the state overlays are born in, so no flash), and the idle timers re-arm so
+// the screen counts down afresh instead of slamming shut.
+static void DimApplyMonHide(DimMon& m, bool hide, ULONGLONG now)
+{
+    m.curAlpha  = 0.0;
+    m.holeLit   = 0.0;
+    m.shown     = false;
+    m.hasActive = false;
+    m.lastSurfAlpha = m.lastHoleAlpha = 0;
+    m.lastActivity = m.lastContentActivity = now;
+    if (m.hwnd)
+    {
+        SetLayeredWindowAttributes(m.hwnd, 0, 0, LWA_ALPHA);
+        DimApplyHole(m, false);
+        ShowWindow(m.hwnd, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
+    }
+    if (m.holeWnd)
+    {
+        SetLayeredWindowAttributes(m.holeWnd, 0, 0, LWA_ALPHA);
+        ShowWindow(m.holeWnd, hide ? SW_HIDE : SW_SHOWNOACTIVATE);
+    }
+    // Release capture here, not in DimPoll: the VR pause skips DimTick outright,
+    // so DimPoll would never come round to do it.
+    if (hide) DimFreeDup(m);
+}
+
+// Hide or restore every overlay.
+static void DimApplyOverlayHide(bool hide)
 {
     ULONGLONG now = GetTickCount64();
-    for (auto& m : g_dimMons)
-    {
-        m.curAlpha = 0.0;
-        m.holeLit  = 0.0;
-        m.shown    = false;
-        m.lastActivity = m.lastContentActivity = now;
-        if (m.hwnd)
-        {
-            SetLayeredWindowAttributes(m.hwnd, 0, 0, LWA_ALPHA);
-            DimApplyHole(m, false);
-            ShowWindow(m.hwnd, g_dimVrPause ? SW_HIDE : SW_SHOWNOACTIVATE);
-        }
-        if (m.holeWnd)
-        {
-            SetLayeredWindowAttributes(m.holeWnd, 0, 0, LWA_ALPHA);
-            ShowWindow(m.holeWnd, g_dimVrPause ? SW_HIDE : SW_SHOWNOACTIVATE);
-        }
-    }
+    for (auto& m : g_dimMons) DimApplyMonHide(m, hide, now);
+}
+
+// True (via lParam bool*) if any visible window's title contains a [Dimmer]
+// PauseWindowTitles entry (case-insensitive; matches the Netflix app and browser
+// tabs alike). Stops enumerating on the first hit.
+static BOOL CALLBACK DimPauseEnumProc(HWND h, LPARAM lp)
+{
+    if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
+
+    // Suspended UWP apps leave their frame window behind, invisible but "visible"
+    // — cloaked. Without this test a closed Netflix app would stand the dimmer
+    // down forever.
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+        return TRUE;
+
+    wchar_t title[256];
+    if (GetWindowTextW(h, title, ARRAYSIZE(title)) <= 0) return TRUE;
+    CharLowerW(title);
+
+    for (auto& t : g_dimCfg.pauseTitles)
+        if (wcsstr(title, t.c_str())) { *(bool*)lp = TRUE; return FALSE; }
+    return TRUE;
+}
+
+// Stand the whole dimmer down while any pause-title window is visible, wherever
+// it sits. Needed twice over for DRM video (Netflix & co): its frames are
+// blanked out of Desktop Duplication captures, so playback reads as stillness
+// and the change detector alone would dim the film — and while it plays, ANY
+// open duplication or overlaid capture-excluded window (even on another screen;
+// MPO disablement is global) can blank entire panels for seconds while the
+// protected path renegotiates. On release the idle timers re-arm, so screens
+// count down afresh rather than dimming the instant the window closes.
+static void DimScanAppPause()
+{
+    if (g_dimCfg.pauseTitles.empty()) return;
+    bool found = false;
+    EnumWindows(DimPauseEnumProc, (LPARAM)&found);
+    if (found == g_dimAppPause) return;
+    g_dimAppPause = found;
+    DimApplyOverlayHide(DimOverlaysShouldHide());
+    DimSetTrayTip();
+    DimLog(found ? "pause-title window present — dimmer stood down"
+                 : "pause-title window gone — dimming re-armed");
 }
 
 // Advance each overlay one tick toward its target opacity.
@@ -1477,12 +1618,25 @@ static void DimTick(ULONGLONG now, double dtMs)
             DimApplyPatch(m, carve);
             DimApplyHole(m, carve);
 
+            // Poke a layered window only when its opacity actually changed — a
+            // steady stream of no-op attribute writes still stirs the compositor,
+            // which matters greatly above protected-video hardware overlays.
             if (m.holeWnd)
             {
                 double holeAlpha = carve ? m.curAlpha * (1.0 - m.holeLit) : 0.0;
-                SetLayeredWindowAttributes(m.holeWnd, 0, (BYTE)(holeAlpha + 0.5), LWA_ALPHA);
+                int holeA = (int)(holeAlpha + 0.5);
+                if (holeA != m.lastHoleAlpha)
+                {
+                    SetLayeredWindowAttributes(m.holeWnd, 0, (BYTE)holeA, LWA_ALPHA);
+                    m.lastHoleAlpha = holeA;
+                }
             }
-            SetLayeredWindowAttributes(m.hwnd, 0, (BYTE)(m.curAlpha + 0.5), LWA_ALPHA);
+            int surfA = (int)(m.curAlpha + 0.5);
+            if (surfA != m.lastSurfAlpha)
+            {
+                SetLayeredWindowAttributes(m.hwnd, 0, (BYTE)surfA, LWA_ALPHA);
+                m.lastSurfAlpha = surfA;
+            }
             // The overlay stays mapped; only its opacity moves. m.shown now tracks
             // the logical dim state for the log, not the window's visibility.
             bool want = m.curAlpha > 0.5;
@@ -1557,7 +1711,17 @@ static int RunDimmer(const std::vector<int>& indices)
     if (g_dimCfg.hotVk)
         hotOk = RegisterHotKey(g_dimCtrl, 1, g_dimCfg.hotMods | MOD_NOREPEAT, g_dimCfg.hotVk) != 0;
 
+    // Seed the app-pause state before building, so a film already playing is
+    // never touched by even a moment of capture.
+    if (!g_dimCfg.pauseTitles.empty())
+    {
+        bool found = false;
+        EnumWindows(DimPauseEnumProc, (LPARAM)&found);
+        g_dimAppPause = found;
+    }
+
     DimBuildMons(hinst);
+    if (DimOverlaysShouldHide()) DimApplyOverlayHide(true);   // StartEnabled = 0 / app pause
     DimOpenLog();
 
     // Startup summary — tell the user up front whether each screen can actually be
@@ -1569,7 +1733,11 @@ static int RunDimmer(const std::vector<int>& indices)
             if (m.dup) okN++;
             else { failHr = m.lastDupHr; failIdx = m.index; }
         wchar_t b[400];
-        if (okN == (int)g_dimMons.size() && okN > 0)
+        if (DimOverlaysShouldHide())   // capture deliberately not opened
+            wsprintfW(b, L"Idle-dim standing by (%s) — %d display(s) configured",
+                      g_dimAppPause ? L"app window present" : L"off",
+                      (int)g_dimMons.size());
+        else if (okN == (int)g_dimMons.size() && okN > 0)
             wsprintfW(b, L"Watching %d display(s) — idle-dim %s", okN, g_dimEnabled ? L"on" : L"off");
         else
             wsprintfW(b, L"Display %d cannot be captured (0x%08X) — it will not dim. "
@@ -1614,29 +1782,35 @@ static int RunDimmer(const std::vector<int>& indices)
             {
                 g_dimRebuildAt = 0;
                 DimBuildMons(hinst);
-                if (g_dimVrPause) DimApplyVrPause();   // fresh overlays must stay banished
+                if (DimOverlaysShouldHide()) DimApplyOverlayHide(true);   // fresh overlays stay banished
             }
         }
 
-        if (g_dimCfg.pauseOnVr && now >= g_dimNextVrScan)
+        if (now >= g_dimNextScan)
         {
-            g_dimNextVrScan = now + kDimVrScanMs;
-            bool vr = DimSteamVrRunning();
-            if (vr != g_dimVrPause)
+            g_dimNextScan = now + kDimScanMs;
+            if (g_dimCfg.pauseOnVr)
             {
-                g_dimVrPause = vr;
-                DimApplyVrPause();
-                DimSetTrayTip();
-                DimLog(vr ? "SteamVR detected — dimming paused, overlays hidden"
-                          : "SteamVR closed — dimming resumed");
+                bool vr = DimSteamVrRunning();
+                if (vr != g_dimVrPause)
+                {
+                    g_dimVrPause = vr;
+                    DimApplyOverlayHide(DimOverlaysShouldHide());
+                    DimSetTrayTip();
+                    DimLog(vr ? "SteamVR detected — dimming paused, overlays hidden"
+                              : "SteamVR closed — dimming resumed");
+                }
             }
+            DimScanAppPause();
         }
 
         double dtMs = (double)(now - last);
         last = now;
         if (dtMs <= 0)   dtMs = frameMs;
         if (dtMs > 250)  dtMs = 250;     // clamp long stalls so the fade can't jump
-        if (!g_dimVrPause) DimTick(now, dtMs);
+        // Any stand-down (VR, pause-title window, toggled off) silences the tick
+        // wholesale — no capture, no window pokes, nothing.
+        if (!DimOverlaysShouldHide()) DimTick(now, dtMs);
 
         if (now - lastTip >= 1000) { lastTip = now; DimRefreshTaskbars(); DimStatusTip(now); }
     }

@@ -95,6 +95,26 @@ entirely — SteamVR's desktop view cannot click through a layered overlay windo
 even a fully transparent one. Dimming resumes automatically once SteamVR exits;
 set `PauseOnSteamVR = 0` in `[Dimmer]` to opt out.
 
+While any window whose title matches `PauseWindowTitles` (default `Netflix`;
+comma-separated, matches the app and browser tabs alike) is visible, the whole
+dimmer likewise stands down. DRM-protected video is blanked out of Desktop
+Duplication captures, so a playing film reads as stillness to the watcher and
+would otherwise be dimmed over mid-scene — and worse, while protected video
+plays, *any* open capture session or overlaid capture-excluded window (even on
+a different monitor: the driver disables MPO overlay scanout globally) can
+force panels to renegotiate playback protection and blank for seconds at a
+time. Dimming resumes automatically when the window closes.
+
+Desktop Duplication is only held open while a screen is actually being judged
+by the idle rule. Toggling dimming off, force dim, VR pause and app-held
+displays all release their capture sessions entirely — an open duplication
+forces the compositor off MPO overlay scanout, and on some driver/monitor
+combinations that transition blanks the whole display for a few seconds. For
+the same reason a capture session that keeps dying young (protected-content
+transitions, fullscreen flips, another grabber) is recreated on an exponential
+backoff rather than a fixed 2 Hz beat; set `Debug = 1` and correlate any
+remaining blank-outs with `duplication lost/created` lines in the log.
+
 ## Interaction with ApplyIccLut
 
 The two tools operate at independent layers — ApplyIccLut writes
