@@ -105,6 +105,36 @@ a different monitor: the driver disables MPO overlay scanout globally) can
 force panels to renegotiate playback protection and blank for seconds at a
 time. Dimming resumes automatically when the window closes.
 
+While a fullscreen or borderless application (typically a game) holds the
+foreground on *any* display, the whole dimmer likewise stands down
+(`PauseOnFullscreen`, default on). This protects G-Sync/VRR: an open Desktop
+Duplication session pushes the compositor off MPO overlay scanout globally, so
+a borderless game loses independent flip and with it variable refresh (under
+"G-Sync: fullscreen mode only") or its clean frame pacing - even when the game
+sits on a monitor the dimmer is not watching. Detection is geometric (the
+foreground window blankets its monitor and carries no caption), debounced over
+two scans so an alt-tab flash never cycles the capture sessions, and dimming
+re-arms automatically once the app yields the foreground. A borderless window
+that keeps its title-bar style escapes the net; add it to `PauseWindowTitles`
+instead.
+
+*Windowed* games - which the geometric test cannot see, yet which still lose
+MPO independent flip (and windowed G-Sync with it) to an open duplication -
+are caught by the ETW present-rate watch (`PauseOnGamePresent`, default on).
+A real-time trace session on the `Microsoft-Windows-DXGI` and `-D3D9`
+providers counts every process's swapchain presents, PresentMon-style but
+without the kernel state machine: the event header alone names the presenter.
+When the foreground process sustains `GamePresentFps` presents/sec (default
+20) and passes a species test - installed under a game store's folder
+(`steamapps\common`, Epic, GOG, Xbox, Riot), or carrying both a renderer and
+a game-input library (XInput/DirectInput/GameInput; the conjunction keeps
+browsers and video players out) - the dimmer stands down through the same
+debounced machinery. The watch needs elevation or Performance Log Users
+membership (tick "Run with highest privileges" on the Task Scheduler entry);
+denied that, it logs one line and leaves the geometric test to work alone.
+The tray tip distinguishes the verdicts: "paused (fullscreen)" versus
+"paused (game)".
+
 Desktop Duplication is only held open while a screen is actually being judged
 by the idle rule. Toggling dimming off, force dim, VR pause and app-held
 displays all release their capture sessions entirely — an open duplication

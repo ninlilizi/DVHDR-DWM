@@ -519,6 +519,9 @@ struct DimmerCfg
     bool   ignoreTaskbar   = true;   // discount changes inside the taskbar
     bool   contentAware    = true;   // keep the active window lit when only it is changing
     bool   pauseOnVr       = true;   // hide the overlays entirely while SteamVR runs
+    bool   pauseOnFullscreen = true; // stand down while a fullscreen/borderless app holds the foreground
+    bool   pauseOnGamePresent = true;  // ETW present-rate watch: stand down while a game presents in the foreground
+    double gamePresentFps  = 20.0;   // presents/sec the foreground process must sustain to count as a game
     bool   debug           = false;  // write interruptions to a diagnostic log
     bool   startEnabled    = true;
     // Lowercased title substrings; any visible window matching one stands the
@@ -591,6 +594,9 @@ static bool                g_dimEnabled = true;
 static bool                g_dimForce   = false;     // constant dimming, ignores activity
 static bool                g_dimVrPause  = false;    // SteamVR alive — dimmer stood down
 static bool                g_dimAppPause = false;    // a pause-title window is visible — stood down
+static bool                g_dimFsPause  = false;    // fullscreen/borderless/game app foreground - stood down
+static int                 g_dimFsAgree  = 0;        // consecutive scans disagreeing with g_dimFsPause
+static const wchar_t*      g_dimFsWhyTip = L"paused (fullscreen)";   // tray text while g_dimFsPause holds
 static ULONGLONG           g_dimNextScan = 0;        // next SteamVR / pause-title sweep
 static bool                g_dimQuit    = false;
 static ULONGLONG           g_dimRebuildAt = 0;       // GetTickCount64 when a settled-topology rebuild is due (0 = none)
@@ -705,6 +711,9 @@ static void LoadDimmerCfg(DimmerCfg& c)
     c.ignoreTaskbar   = have ? (GetPrivateProfileIntA("Dimmer", "IgnoreTaskbar", 1, ini) != 0) : true;
     c.contentAware    = have ? (GetPrivateProfileIntA("Dimmer", "ContentAware", 1, ini) != 0) : true;
     c.pauseOnVr       = have ? (GetPrivateProfileIntA("Dimmer", "PauseOnSteamVR", 1, ini) != 0) : true;
+    c.pauseOnFullscreen = have ? (GetPrivateProfileIntA("Dimmer", "PauseOnFullscreen", 1, ini) != 0) : true;
+    c.pauseOnGamePresent = have ? (GetPrivateProfileIntA("Dimmer", "PauseOnGamePresent", 1, ini) != 0) : true;
+    c.gamePresentFps  = F("GamePresentFps", 20.0);
     c.debug           = have ? (GetPrivateProfileIntA("Dimmer", "Debug", 0, ini) != 0) : false;
     c.startEnabled    = have ? (GetPrivateProfileIntA("Dimmer", "StartEnabled", 1, ini) != 0) : true;
 
@@ -1152,7 +1161,8 @@ static void DimSetTrayTip()
 {
     wsprintfW(g_dimNid.szTip, L"DVHDR idle-dim: %s",
               g_dimVrPause  ? L"paused (SteamVR)" :
-              g_dimAppPause ? L"paused (app)"     : (g_dimEnabled ? L"on" : L"off"));
+              g_dimAppPause ? L"paused (app)"     :
+              g_dimFsPause  ? g_dimFsWhyTip       : (g_dimEnabled ? L"on" : L"off"));
     g_dimNid.uFlags = NIF_TIP;
     Shell_NotifyIconW(NIM_MODIFY, &g_dimNid);
 }
@@ -1166,12 +1176,13 @@ static void DimStatusTip(ULONGLONG now)
     wchar_t buf[128];
     int off = wsprintfW(buf, L"DVHDR idle-dim: %s",
                         g_dimVrPause  ? L"paused (SteamVR)" :
-                        g_dimAppPause ? L"paused (app)"
+                        g_dimAppPause ? L"paused (app)"     :
+                        g_dimFsPause  ? g_dimFsWhyTip
                                       : (g_dimForce ? L"FORCED" : (g_dimEnabled ? L"on" : L"off")));
     // Per-monitor detail only while screens are actually being judged — when the
     // dimmer is off or stood down, capture is deliberately released and idle
     // counts are meaningless (a bare "no-capture" would read as a fault).
-    bool judging = !g_dimVrPause && !g_dimAppPause && (g_dimEnabled || g_dimForce);
+    bool judging = !g_dimVrPause && !g_dimAppPause && !g_dimFsPause && (g_dimEnabled || g_dimForce);
     for (auto& m : g_dimMons)
     {
         if (!judging || off > 110) break;
@@ -1482,7 +1493,7 @@ static bool DimSteamVrRunning()
 // whole dimmer down rather than merely its own display.
 static bool DimOverlaysShouldHide()
 {
-    return g_dimVrPause || g_dimAppPause || (!g_dimEnabled && !g_dimForce);
+    return g_dimVrPause || g_dimAppPause || g_dimFsPause || (!g_dimEnabled && !g_dimForce);
 }
 
 // Hide or restore ONE monitor's overlays. Hidden means truly stood down: alpha
@@ -1565,6 +1576,321 @@ static void DimScanAppPause()
     DimSetTrayTip();
     DimLog(found ? "pause-title window present — dimmer stood down"
                  : "pause-title window gone — dimming re-armed");
+}
+
+// ---- ETW present-rate watch (PresentMon's wells, drunk shallowly) ----
+// A real-time trace session on the Microsoft-Windows-DXGI and -D3D9 user-mode
+// providers. Their Present_Start events fire in the presenting process, so the
+// event header's ProcessId alone says who is pushing frames - no payload
+// decoding, no DxgKrnl state machine. The consumer thread tallies presents per
+// PID; each 2-second scan reads the foreground process's tally and clears the
+// board, yielding its present rate. Needs elevation or membership in the
+// Performance Log Users group; when denied the watch quietly stands aside and
+// the geometric fullscreen test carries on alone.
+
+static const wchar_t* kDimEtwName = L"DVHDR-DimPresentWatch";
+static const GUID kDimEtwDxgi = { 0xCA11C036, 0x0102, 0x4A2D, { 0xA6, 0xAD, 0xF0, 0x3C, 0xFE, 0xD5, 0xD3, 0xC9 } };
+static const GUID kDimEtwD3D9 = { 0x783ACA0A, 0x790E, 0x4D7F, { 0x84, 0x51, 0xAA, 0x85, 0x05, 0x11, 0xC6, 0xB9 } };
+
+#ifndef INVALID_PROCESSTRACE_HANDLE
+#define INVALID_PROCESSTRACE_HANDLE ((TRACEHANDLE)INVALID_HANDLE_VALUE)
+#endif
+
+static bool        g_dimEtwActive   = false;
+static TRACEHANDLE g_dimEtwSession  = 0;
+static TRACEHANDLE g_dimEtwOpen     = INVALID_PROCESSTRACE_HANDLE;
+static HANDLE      g_dimEtwThread   = NULL;
+static SRWLOCK     g_dimEtwLock     = SRWLOCK_INIT;
+static std::unordered_map<DWORD, ULONG> g_dimEtwCounts;
+static ULONGLONG   g_dimEtwLastSnap = 0;
+
+// EVENT_TRACE_PROPERTIES demands trailing space for the logger name.
+struct DimEtwProps { EVENT_TRACE_PROPERTIES p; wchar_t name[64]; };
+
+static void DimEtwInitProps(DimEtwProps& props)
+{
+    ZeroMemory(&props, sizeof(props));
+    props.p.Wnode.BufferSize    = sizeof(props);
+    props.p.Wnode.ClientContext = 1;
+    props.p.Wnode.Flags         = WNODE_FLAG_TRACED_GUID;
+    props.p.BufferSize          = 64;
+    props.p.MinimumBuffers      = 4;
+    props.p.MaximumBuffers      = 8;
+    props.p.FlushTimer          = 1;
+    props.p.LogFileMode         = EVENT_TRACE_REAL_TIME_MODE;
+    props.p.LoggerNameOffset    = sizeof(EVENT_TRACE_PROPERTIES);
+}
+
+static VOID WINAPI DimPresentEtwCallback(PEVENT_RECORD rec)
+{
+    USHORT id = rec->EventHeader.EventDescriptor.Id;
+    // DXGI: 42 = Present_Start, 55 = PresentMultiplaneOverlay_Start. D3D9: 1 = Present_Start.
+    bool present =
+        (IsEqualGUID(rec->EventHeader.ProviderId, kDimEtwDxgi) && (id == 42 || id == 55)) ||
+        (IsEqualGUID(rec->EventHeader.ProviderId, kDimEtwD3D9) && id == 1);
+    if (!present) return;
+    AcquireSRWLockExclusive(&g_dimEtwLock);
+    g_dimEtwCounts[rec->EventHeader.ProcessId]++;
+    ReleaseSRWLockExclusive(&g_dimEtwLock);
+}
+
+static DWORD WINAPI DimPresentEtwThread(LPVOID)
+{
+    ProcessTrace(&g_dimEtwOpen, 1, NULL, NULL);   // blocks until the session stops
+    return 0;
+}
+
+static bool DimPresentEtwStart()
+{
+    DimEtwProps props;
+    DimEtwInitProps(props);
+    ULONG rc = StartTraceW(&g_dimEtwSession, kDimEtwName, &props.p);
+    if (rc == ERROR_ALREADY_EXISTS)
+    {
+        // ETW sessions are kernel objects and outlive a crashed owner - reap
+        // the stale one and claim the name afresh.
+        DimEtwInitProps(props);
+        ControlTraceW(0, kDimEtwName, &props.p, EVENT_TRACE_CONTROL_STOP);
+        DimEtwInitProps(props);
+        rc = StartTraceW(&g_dimEtwSession, kDimEtwName, &props.p);
+    }
+    if (rc != ERROR_SUCCESS)
+    {
+        DimLog("present watch: StartTrace failed (%lu)%s", rc,
+               rc == ERROR_ACCESS_DENIED ? " - run elevated or join Performance Log Users" : "");
+        return false;
+    }
+
+    EnableTraceEx2(g_dimEtwSession, &kDimEtwDxgi, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                   TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+    EnableTraceEx2(g_dimEtwSession, &kDimEtwD3D9, EVENT_CONTROL_CODE_ENABLE_PROVIDER,
+                   TRACE_LEVEL_INFORMATION, 0, 0, 0, NULL);
+
+    EVENT_TRACE_LOGFILEW lf = {};
+    lf.LoggerName          = (LPWSTR)kDimEtwName;
+    lf.ProcessTraceMode    = PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
+    lf.EventRecordCallback = DimPresentEtwCallback;
+    g_dimEtwOpen = OpenTraceW(&lf);
+    if (g_dimEtwOpen == INVALID_PROCESSTRACE_HANDLE)
+    {
+        DimLog("present watch: OpenTrace failed (%lu)", GetLastError());
+        DimEtwInitProps(props);
+        ControlTraceW(g_dimEtwSession, NULL, &props.p, EVENT_TRACE_CONTROL_STOP);
+        return false;
+    }
+    g_dimEtwThread = CreateThread(NULL, 0, DimPresentEtwThread, NULL, 0, NULL);
+    if (!g_dimEtwThread)
+    {
+        CloseTrace(g_dimEtwOpen);
+        g_dimEtwOpen = INVALID_PROCESSTRACE_HANDLE;
+        DimEtwInitProps(props);
+        ControlTraceW(g_dimEtwSession, NULL, &props.p, EVENT_TRACE_CONTROL_STOP);
+        return false;
+    }
+    g_dimEtwLastSnap = GetTickCount64();
+    g_dimEtwActive   = true;
+    DimLog("present watch armed (threshold %.0f presents/sec)", g_dimCfg.gamePresentFps);
+    return true;
+}
+
+static void DimPresentEtwStop()
+{
+    if (!g_dimEtwActive) return;
+    DimEtwProps props;
+    DimEtwInitProps(props);
+    ControlTraceW(g_dimEtwSession, NULL, &props.p, EVENT_TRACE_CONTROL_STOP);
+    if (g_dimEtwOpen != INVALID_PROCESSTRACE_HANDLE)
+    {
+        CloseTrace(g_dimEtwOpen);
+        g_dimEtwOpen = INVALID_PROCESSTRACE_HANDLE;
+    }
+    if (g_dimEtwThread)
+    {
+        WaitForSingleObject(g_dimEtwThread, 2000);
+        CloseHandle(g_dimEtwThread);
+        g_dimEtwThread = NULL;
+    }
+    g_dimEtwActive = false;
+}
+
+// Presents/sec for one PID since the previous call. Clears the whole tally so
+// each scan reads a fresh window; must therefore be called exactly once per scan.
+static double DimPresentSample(DWORD pid, ULONGLONG now)
+{
+    ULONG count = 0;
+    AcquireSRWLockExclusive(&g_dimEtwLock);
+    if (pid)
+    {
+        auto it = g_dimEtwCounts.find(pid);
+        if (it != g_dimEtwCounts.end()) count = it->second;
+    }
+    g_dimEtwCounts.clear();
+    ReleaseSRWLockExclusive(&g_dimEtwLock);
+    double sec = (now - g_dimEtwLastSnap) / 1000.0;
+    g_dimEtwLastSnap = now;
+    return sec > 0.05 ? count / sec : 0.0;
+}
+
+// A high present rate alone is not a game - browsers and video players push
+// 24-60 fps too. The species test: the process either lives in a game store's
+// install grounds, or has BOTH a renderer and a game-input library loaded (the
+// conjunction matters; Chromium loads Direct3D, and will even load XInput when
+// a gamepad is plugged in, but games rarely present fast without both).
+// Positive verdicts are cached by PID; negatives re-examined each scan since
+// modules can load late.
+static bool DimGameProcess(DWORD pid)
+{
+    static std::vector<DWORD> knownGames;
+    for (DWORD p : knownGames) if (p == pid) return true;
+
+    wchar_t path[MAX_PATH] = {};
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h)
+    {
+        DWORD n = ARRAYSIZE(path);
+        if (QueryFullProcessImageNameW(h, 0, path, &n)) CharLowerW(path);
+        else path[0] = 0;
+        CloseHandle(h);
+    }
+
+    bool game = false;
+    static const wchar_t* kStoreDirs[] = {
+        L"\\steamapps\\common\\", L"\\epic games\\", L"\\gog galaxy\\games\\",
+        L"\\gog games\\", L"\\xboxgames\\", L"\\riot games\\" };
+    if (path[0])
+        for (auto* d : kStoreDirs)
+            if (wcsstr(path, d)) { game = true; break; }
+
+    if (!game)
+    {
+        bool renderer = false, input = false;
+        static const wchar_t* kRender[] = { L"d3d9.dll", L"d3d11.dll", L"d3d12.dll",
+                                            L"opengl32.dll", L"vulkan-1.dll" };
+        static const wchar_t* kInput[]  = { L"xinput1_4.dll", L"xinput1_3.dll", L"xinput9_1_0.dll",
+                                            L"dinput8.dll", L"gameinput.dll" };
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+        if (snap != INVALID_HANDLE_VALUE)
+        {
+            MODULEENTRY32W me = {}; me.dwSize = sizeof(me);
+            if (Module32FirstW(snap, &me))
+            {
+                do
+                {
+                    if (!renderer)
+                        for (auto* r : kRender) if (!_wcsicmp(me.szModule, r)) { renderer = true; break; }
+                    if (!input)
+                        for (auto* i : kInput)  if (!_wcsicmp(me.szModule, i)) { input = true; break; }
+                }
+                while ((!renderer || !input) && Module32NextW(snap, &me));
+            }
+            CloseHandle(snap);
+        }
+        game = renderer && input;
+    }
+
+    if (game)
+    {
+        if (knownGames.size() > 32) knownGames.clear();   // PIDs recycle; keep the cache short-lived
+        knownGames.push_back(pid);
+    }
+    return game;
+}
+
+// True when the foreground window is a fullscreen or borderless application:
+// it blankets its whole monitor and carries no caption. The caption test is what
+// separates borderless from an ordinary maximized window - a maximized captioned
+// window also overhangs its monitor (by its resize borders), most visibly with an
+// auto-hidden taskbar, and must not stand the dimmer down. Shell surfaces that
+// legitimately cover a monitor (desktop, task view, alt-tab host) are excluded
+// by class, as are cloaked UWP remnants and our own windows.
+static bool DimFullscreenForeground()
+{
+    HWND w = GetForegroundWindow();
+    if (!w || w == GetShellWindow()) return false;
+
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    if (pid == GetCurrentProcessId()) return false;
+
+    if (!IsWindowVisible(w) || IsIconic(w)) return false;
+
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+        return false;
+
+    wchar_t cls[64] = {};
+    GetClassNameW(w, cls, ARRAYSIZE(cls));
+    static const wchar_t* kShellClasses[] = {
+        L"Progman", L"WorkerW", L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
+        L"MultitaskingViewFrame", L"XamlExplorerHostIslandWindow",
+        L"ForegroundStaging", L"TaskListThumbnailWnd", L"Windows.UI.Core.CoreWindow" };
+    for (auto* c : kShellClasses)
+        if (!_wcsicmp(cls, c)) return false;
+
+    LONG style = GetWindowLongW(w, GWL_STYLE);
+    if ((style & WS_CAPTION) == WS_CAPTION) return false;
+
+    RECT wr;
+    if (!GetWindowRect(w, &wr)) return false;
+    HMONITOR mon = MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO mi = { sizeof(mi) };
+    if (!GetMonitorInfoW(mon, &mi)) return false;
+    return wr.left  <= mi.rcMonitor.left  && wr.top    <= mi.rcMonitor.top
+        && wr.right >= mi.rcMonitor.right && wr.bottom >= mi.rcMonitor.bottom;
+}
+
+// Stand the whole dimmer down while a fullscreen/borderless app is in the
+// foreground. The point is G-Sync/VRR: while any Desktop Duplication session is
+// open the compositor abandons MPO overlay scanout GLOBALLY, so a borderless
+// game - on ANY monitor, watched or not - loses independent flip and with it
+// variable refresh (or, at best, its clean frame pacing). Releasing every
+// capture and hiding every overlay restores the game's flip path. The state
+// must be seen on two consecutive scans before it flips, because the capture
+// teardown/rebuild is itself the transition that can blank panels - a fleeting
+// alt-tab or task-view flash must not cycle it.
+static void DimScanFullscreen()
+{
+    bool etwOn = g_dimCfg.pauseOnGamePresent && g_dimEtwActive;
+    if (!g_dimCfg.pauseOnFullscreen && !etwOn) return;
+
+    HWND  fg  = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg) GetWindowThreadProcessId(fg, &pid);
+
+    bool   hit = g_dimCfg.pauseOnFullscreen && DimFullscreenForeground();
+    bool   viaPresent = false;
+    double fps = 0.0;
+    if (etwOn)
+    {
+        // Sampled every scan even when the geometric test already decided -
+        // the tally window must stay one scan wide.
+        fps = DimPresentSample(pid, GetTickCount64());
+        if (!hit && pid && fps >= g_dimCfg.gamePresentFps && DimGameProcess(pid))
+        {
+            hit = true;
+            viaPresent = true;
+        }
+    }
+
+    if (hit == g_dimFsPause) { g_dimFsAgree = 0; return; }
+    if (++g_dimFsAgree < 2) return;
+    g_dimFsAgree = 0;
+    g_dimFsPause = hit;
+    if (hit) g_dimFsWhyTip = viaPresent ? L"paused (game)" : L"paused (fullscreen)";
+    DimApplyOverlayHide(DimOverlaysShouldHide());
+    DimSetTrayTip();
+    if (hit)
+    {
+        wchar_t title[128] = {};
+        if (fg) GetWindowTextW(fg, title, ARRAYSIZE(title));
+        if (viaPresent)
+            DimLog("game presenting at %.0f fps in foreground (\"%ls\", pid %lu) - dimmer stood down",
+                   fps, title, pid);
+        else
+            DimLog("fullscreen app foreground (\"%ls\") - dimmer stood down", title);
+    }
+    else
+        DimLog("fullscreen/game app gone - dimming re-armed");
 }
 
 // Advance each overlay one tick toward its target opacity.
@@ -1719,10 +2045,15 @@ static int RunDimmer(const std::vector<int>& indices)
         EnumWindows(DimPauseEnumProc, (LPARAM)&found);
         g_dimAppPause = found;
     }
+    // Likewise a game already running: no debounce at startup, judged directly,
+    // so its flip path is never disturbed by even one capture create.
+    if (g_dimCfg.pauseOnFullscreen)
+        g_dimFsPause = DimFullscreenForeground();
 
     DimBuildMons(hinst);
     if (DimOverlaysShouldHide()) DimApplyOverlayHide(true);   // StartEnabled = 0 / app pause
     DimOpenLog();
+    if (g_dimCfg.pauseOnGamePresent) DimPresentEtwStart();
 
     // Startup summary — tell the user up front whether each screen can actually be
     // captured (Desktop Duplication can fail on HDR via the legacy path, when
@@ -1735,13 +2066,17 @@ static int RunDimmer(const std::vector<int>& indices)
         wchar_t b[400];
         if (DimOverlaysShouldHide())   // capture deliberately not opened
             wsprintfW(b, L"Idle-dim standing by (%s) — %d display(s) configured",
-                      g_dimAppPause ? L"app window present" : L"off",
+                      g_dimAppPause ? L"app window present" :
+                      g_dimFsPause  ? L"fullscreen app"     : L"off",
                       (int)g_dimMons.size());
         else if (okN == (int)g_dimMons.size() && okN > 0)
             wsprintfW(b, L"Watching %d display(s) — idle-dim %s", okN, g_dimEnabled ? L"on" : L"off");
         else
             wsprintfW(b, L"Display %d cannot be captured (0x%08X) — it will not dim. "
                          L"Close any other screen-capture tool and retry.", failIdx, (unsigned)failHr);
+        if (g_dimCfg.pauseOnGamePresent && !g_dimEtwActive)
+            wsprintfW(b + lstrlenW(b),
+                      L"\nGame-present watch unavailable - run elevated or join Performance Log Users");
         if (g_dimLog && g_dimLogPath[0])
         {
             wchar_t wpath[MAX_PATH] = {};
@@ -1802,6 +2137,7 @@ static int RunDimmer(const std::vector<int>& indices)
                 }
             }
             DimScanAppPause();
+            DimScanFullscreen();
         }
 
         double dtMs = (double)(now - last);
@@ -1816,6 +2152,7 @@ static int RunDimmer(const std::vector<int>& indices)
     }
 
     DimLog("dimmer stopping");
+    DimPresentEtwStop();
     DimDestroyMons();
     Shell_NotifyIconW(NIM_DELETE, &g_dimNid);
     if (hotOk)     UnregisterHotKey(g_dimCtrl, 1);
