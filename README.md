@@ -68,82 +68,12 @@ resolved at solution-open time:
 `dvhdrloader.exe --unload` removes the DLL and deletes the installed files.
 `dvhdrloader.exe --help` lists all flags.
 
-## Idle-screen dimmer
+## Idle-screen dimmer (moved out)
 
-A separate, self-contained feature of the loader — **not** the injected shader —
-for taming light spill from a secondary monitor while you game on another.
-`dvhdrloader.exe --dim 2` starts a persistent watcher (in the user session, no
-injection) that watches Display 2 with the DXGI Desktop Duplication API; when
-nothing changes on it for `IdleSeconds` it gradually fades a transparent,
-click-through black overlay over that screen down to `Level`% brightness, then
-lifts it again quickly when activity returns (a frame update, or the cursor
-moving onto it). Several screens at once: `--dim 2,3`. It dims HDR content
-correctly (a black overlay multiplies the composited picture).
-
-Toggle the whole behaviour on/off at runtime with the global hotkey (default
-`Ctrl+Alt+Shift+D`) **or** by clicking the tray icon — each flip shows a balloon
-notice and beeps so you know it registered. Right-click the tray icon for a menu:
-*Idle dimming* (the same on/off), *Force dim (always on)* — hold the screen dark
-constantly regardless of activity until you turn it off again ("enforce the
-night") — and *Exit*. `dvhdrloader.exe --dim-stop` also stops a running watcher. All timings live in
-the `[Dimmer]` section of `dvhdr.ini` (IdleSeconds, Level, FadeSeconds,
-WakeFadeSeconds, ToggleHotkey, StartEnabled). For persistence, add a second Task
-Scheduler entry running `--dim N` at logon ("only when logged on").
-
-While SteamVR is running the watcher pauses itself and hides the overlays
-entirely — SteamVR's desktop view cannot click through a layered overlay window,
-even a fully transparent one. Dimming resumes automatically once SteamVR exits;
-set `PauseOnSteamVR = 0` in `[Dimmer]` to opt out.
-
-While any window whose title matches `PauseWindowTitles` (default `Netflix`;
-comma-separated, matches the app and browser tabs alike) is visible, the whole
-dimmer likewise stands down. DRM-protected video is blanked out of Desktop
-Duplication captures, so a playing film reads as stillness to the watcher and
-would otherwise be dimmed over mid-scene — and worse, while protected video
-plays, *any* open capture session or overlaid capture-excluded window (even on
-a different monitor: the driver disables MPO overlay scanout globally) can
-force panels to renegotiate playback protection and blank for seconds at a
-time. Dimming resumes automatically when the window closes.
-
-While a fullscreen or borderless application (typically a game) holds the
-foreground on *any* display, the whole dimmer likewise stands down
-(`PauseOnFullscreen`, default on). This protects G-Sync/VRR: an open Desktop
-Duplication session pushes the compositor off MPO overlay scanout globally, so
-a borderless game loses independent flip and with it variable refresh (under
-"G-Sync: fullscreen mode only") or its clean frame pacing - even when the game
-sits on a monitor the dimmer is not watching. Detection is geometric (the
-foreground window blankets its monitor and carries no caption), debounced over
-two scans so an alt-tab flash never cycles the capture sessions, and dimming
-re-arms automatically once the app yields the foreground. A borderless window
-that keeps its title-bar style escapes the net; add it to `PauseWindowTitles`
-instead.
-
-*Windowed* games - which the geometric test cannot see, yet which still lose
-MPO independent flip (and windowed G-Sync with it) to an open duplication -
-are caught by the ETW present-rate watch (`PauseOnGamePresent`, default on).
-A real-time trace session on the `Microsoft-Windows-DXGI` and `-D3D9`
-providers counts every process's swapchain presents, PresentMon-style but
-without the kernel state machine: the event header alone names the presenter.
-When the foreground process sustains `GamePresentFps` presents/sec (default
-20) and passes a species test - installed under a game store's folder
-(`steamapps\common`, Epic, GOG, Xbox, Riot), or carrying both a renderer and
-a game-input library (XInput/DirectInput/GameInput; the conjunction keeps
-browsers and video players out) - the dimmer stands down through the same
-debounced machinery. The watch needs elevation or Performance Log Users
-membership (tick "Run with highest privileges" on the Task Scheduler entry);
-denied that, it logs one line and leaves the geometric test to work alone.
-The tray tip distinguishes the verdicts: "paused (fullscreen)" versus
-"paused (game)".
-
-Desktop Duplication is only held open while a screen is actually being judged
-by the idle rule. Toggling dimming off, force dim, VR pause and app-held
-displays all release their capture sessions entirely — an open duplication
-forces the compositor off MPO overlay scanout, and on some driver/monitor
-combinations that transition blanks the whole display for a few seconds. For
-the same reason a capture session that keeps dying young (protected-content
-transitions, fullscreen flips, another grabber) is recreated on an exponential
-backoff rather than a fixed 2 Hz beat; set `Debug = 1` and correlate any
-remaining blank-outs with `duplication lost/created` lines in the log.
+The idle-screen dimmer that used to live here as `dvhdrloader --dim` has been
+split into its own standalone application, **OLEDSaver**, so it no longer shares
+a process with the DWM shader injection (which suppresses MPO overlay scanout and
+can itself harm G-Sync). See the sibling `OLEDSaver` repository.
 
 ## Interaction with ApplyIccLut
 
