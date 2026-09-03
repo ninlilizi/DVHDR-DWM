@@ -30,6 +30,34 @@ extern "C" {
 
 static HMODULE g_realDxgi = NULL;
 
+typedef HRESULT (WINAPI* CreateDXGIFactory_t)(REFIID, void**);
+typedef HRESULT (WINAPI* CreateDXGIFactory2_t)(UINT, REFIID, void**);
+static CreateDXGIFactory_t  g_realCreateDXGIFactory  = NULL;
+static CreateDXGIFactory_t  g_realCreateDXGIFactory1 = NULL;
+static CreateDXGIFactory2_t g_realCreateDXGIFactory2 = NULL;
+
+void Hook_WaitReady();
+
+// The factory exports are the one door every swap chain must pass through;
+// they hold until the Present hooks are installed (see Hook_WaitReady).
+static HRESULT WINAPI Gate_CreateDXGIFactory(REFIID riid, void** out)
+{
+    Hook_WaitReady();
+    return g_realCreateDXGIFactory(riid, out);
+}
+
+static HRESULT WINAPI Gate_CreateDXGIFactory1(REFIID riid, void** out)
+{
+    Hook_WaitReady();
+    return g_realCreateDXGIFactory1(riid, out);
+}
+
+static HRESULT WINAPI Gate_CreateDXGIFactory2(UINT flags, REFIID riid, void** out)
+{
+    Hook_WaitReady();
+    return g_realCreateDXGIFactory2(flags, riid, out);
+}
+
 bool Exports_Init()
 {
     char sys[MAX_PATH];
@@ -69,7 +97,16 @@ bool Exports_Init()
     for (const auto& e : map)
         *e.slot = (void*)GetProcAddress(g_realDxgi, e.name);
 
-    // CreateDXGIFactory2 is the one d3d11.dll statically imports — its absence
+    // CreateDXGIFactory2 is the one d3d11.dll statically imports - its absence
     // would mean the genuine dxgi is fundamentally wrong. Treat as fatal.
-    return p_CreateDXGIFactory2 != NULL;
+    if (!p_CreateDXGIFactory2) return false;
+
+    // The factory thunks jump into the gates, which forward to the real ones.
+    g_realCreateDXGIFactory  = (CreateDXGIFactory_t)p_CreateDXGIFactory;
+    g_realCreateDXGIFactory1 = (CreateDXGIFactory_t)p_CreateDXGIFactory1;
+    g_realCreateDXGIFactory2 = (CreateDXGIFactory2_t)p_CreateDXGIFactory2;
+    if (g_realCreateDXGIFactory)  p_CreateDXGIFactory  = (void*)Gate_CreateDXGIFactory;
+    if (g_realCreateDXGIFactory1) p_CreateDXGIFactory1 = (void*)Gate_CreateDXGIFactory1;
+    p_CreateDXGIFactory2 = (void*)Gate_CreateDXGIFactory2;
+    return true;
 }

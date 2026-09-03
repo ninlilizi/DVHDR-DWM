@@ -21,6 +21,7 @@ struct DisplayState
     bool  Known;          // false when the output could not be resolved
     bool  HdrMode;        // the output is scanning out in HDR (PQ) mode
     float SdrWhiteNits;   // Windows' SDR white level for that output; 0 when unavailable
+    int   DisplayNumber;  // the Windows display number of that output (the N of [Display.N]); 0 = unknown
 };
 
 // State of the output the swap chain presents to. Cached about a second per chain.

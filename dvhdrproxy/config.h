@@ -108,6 +108,9 @@ struct SurfaceInfo
     float SdrGamma;       // CSP_SDR only: 0 = sRGB piecewise, else the exponent
     float SdrSteps;       // CSP_SDR only: code steps of the back buffer
     float ContentPeak;    // declared HDR content peak (nits) from SetHDRMetaData; 0 = none
+    float Peak, MaxFALL, Black, BlackLift;   // panel capabilities of the monitor holding the window
+    int   DisplayNumber;  // that monitor's Windows display number; 0 = unknown, global [Display] used
+    bool  SdrOutput;      // an scRGB chain shown on a monitor not in HDR mode: ceiling held at scRGB white
 };
 
 // Records the module handle of this proxy DLL so config can be read from the

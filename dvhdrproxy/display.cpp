@@ -83,6 +83,16 @@ bool Display_IsOpaqueChain(IDXGISwapChain* sc)
     return opaque;
 }
 
+// The N in the GDI device name of the monitor, which is the N of [Display.N].
+static int DisplayNumberForMonitor(HMONITOR mon)
+{
+    MONITORINFOEXW mi = {};
+    mi.cbSize = sizeof(mi);
+    if (!GetMonitorInfoW(mon, &mi)) return 0;
+    const wchar_t* tag = wcsstr(mi.szDevice, L"DISPLAY");
+    return tag ? _wtoi(tag + 7) : 0;
+}
+
 // Windows reports the SDR white level per display path in thousandths of 80 nits.
 static float SdrWhiteLevelForMonitor(HMONITOR mon)
 {
@@ -199,6 +209,7 @@ DisplayState Display_Query(IDXGISwapChain* sc)
     {
         st.Known   = true;
         st.HdrMode = (d.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+        st.DisplayNumber = DisplayNumberForMonitor(d.Monitor);
         if (st.HdrMode) st.SdrWhiteNits = SdrWhiteLevelForMonitor(d.Monitor);
     }
 

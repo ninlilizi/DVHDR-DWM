@@ -87,6 +87,47 @@ void Config_Load()
     g_knobs.DitherHighlightBoost = IniFloat("Dither",    "HighlightBoost", 2.0f);
 }
 
+// Panel capabilities per monitor: a [Display.N] section may override any of
+// Peak / MaxFALL / Black / BlackLift for Windows display N, as on the DWM side;
+// anything omitted there inherits the global [Display]. Read once per monitor.
+struct MonitorCaps
+{
+    int   number = 0;
+    float Peak = 0, MaxFALL = 0, Black = 0, BlackLift = 0;
+};
+static const int   kMonitorCaps = 8;
+static MonitorCaps g_monitorCaps[kMonitorCaps];
+
+static void ResolveCaps(int displayNumber, SurfaceInfo* out)
+{
+    out->Peak      = g_knobs.DisplayPeak;
+    out->MaxFALL   = g_knobs.DisplayMaxFALL;
+    out->Black     = g_knobs.DisplayBlack;
+    out->BlackLift = g_knobs.BlackLift;
+    if (displayNumber <= 0) return;
+
+    MonitorCaps* c = NULL;
+    for (int i = 0; i < kMonitorCaps && !c; i++)
+        if (g_monitorCaps[i].number == displayNumber) c = &g_monitorCaps[i];
+    if (!c)
+    {
+        for (int i = 0; i < kMonitorCaps && !c; i++)
+            if (g_monitorCaps[i].number == 0) c = &g_monitorCaps[i];
+        if (!c) c = &g_monitorCaps[0];
+        char sec[32];
+        snprintf(sec, sizeof(sec), "Display.%d", displayNumber);
+        c->number    = displayNumber;
+        c->Peak      = IniFloat(sec, "Peak",      g_knobs.DisplayPeak);
+        c->MaxFALL   = IniFloat(sec, "MaxFALL",   g_knobs.DisplayMaxFALL);
+        c->Black     = IniFloat(sec, "Black",     g_knobs.DisplayBlack);
+        c->BlackLift = IniFloat(sec, "BlackLift", g_knobs.BlackLift);
+    }
+    out->Peak      = c->Peak;
+    out->MaxFALL   = c->MaxFALL;
+    out->Black     = c->Black;
+    out->BlackLift = c->BlackLift;
+}
+
 static bool IsSrgbFormat(DXGI_FORMAT fmt)
 {
     return fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
@@ -194,9 +235,25 @@ bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* ou
 
     *out = {};
     out->ColorSpace = csp;
+
+    // The monitor holding most of the window decides the panel capabilities,
+    // so they follow the window from screen to screen.
+    DisplayState ds = Display_Query(sc);
+    out->DisplayNumber = ds.DisplayNumber;
+    ResolveCaps(ds.DisplayNumber, out);
+
+    // An scRGB chain on a monitor that is not in HDR mode is clipped by DWM at
+    // 1.0, which is 80 nits: hold the ceiling there so the rolloff does the
+    // compressing gracefully instead of the compositor chopping it.
+    if (csp == CSP_SCRGB && ds.Known && !ds.HdrMode)
+    {
+        out->SdrOutput = true;
+        if (out->Peak    > 80.0f) out->Peak    = 80.0f;
+        if (out->MaxFALL > 80.0f) out->MaxFALL = 80.0f;
+    }
+
     if (csp == CSP_SDR)
     {
-        DisplayState ds = Display_Query(sc);
         out->SdrWhiteNits = ResolveSdrWhite(ds);
         out->SdrGamma     = ResolveSdrGamma(fmt, ds);
         out->SdrSteps     = StepsForFormat(fmt);
@@ -209,12 +266,16 @@ bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* ou
 
 void Config_DescribeSurface(const SurfaceInfo& surf, char* buf, size_t n)
 {
+    int len;
     if (surf.ColorSpace == CSP_SDR)
-        snprintf(buf, n, "applied: SDR white=%.0f gamma=%.2f steps=%.0f", surf.SdrWhiteNits, surf.SdrGamma, surf.SdrSteps);
+        len = snprintf(buf, n, "applied: SDR white=%.0f gamma=%.2f steps=%.0f", surf.SdrWhiteNits, surf.SdrGamma, surf.SdrSteps);
     else if (surf.ContentPeak > 0.0f)
-        snprintf(buf, n, "applied: %s, content peak %.0f nits", (surf.ColorSpace == CSP_HDR10) ? "HDR10" : "scRGB", surf.ContentPeak);
+        len = snprintf(buf, n, "applied: %s, content peak %.0f nits", (surf.ColorSpace == CSP_HDR10) ? "HDR10" : "scRGB", surf.ContentPeak);
     else
-        snprintf(buf, n, "applied: %s", (surf.ColorSpace == CSP_HDR10) ? "HDR10" : "scRGB");
+        len = snprintf(buf, n, "applied: %s", (surf.ColorSpace == CSP_HDR10) ? "HDR10" : "scRGB");
+    if (len < 0 || (size_t)len >= n) return;
+    snprintf(buf + len, n - len, ", display %d peak %.0f fall %.0f%s", surf.DisplayNumber, surf.Peak, surf.MaxFALL,
+             surf.SdrOutput ? " (monitor in SDR mode: ceiling 80 nits)" : "");
 }
 
 void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf, float frameTimeMs, UINT frameIndex)
@@ -223,9 +284,9 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf,
     cb->BufferH             = h;
     cb->ColorSpace          = surf.ColorSpace;
     cb->FrameTimeMs         = frameTimeMs;
-    cb->DisplayPeak         = g_knobs.DisplayPeak;
-    cb->DisplayMaxFALL      = g_knobs.DisplayMaxFALL;
-    cb->DisplayBlack        = g_knobs.DisplayBlack;
+    cb->DisplayPeak         = surf.Peak;
+    cb->DisplayMaxFALL      = surf.MaxFALL;
+    cb->DisplayBlack        = surf.Black;
     cb->HeadroomPercent     = g_knobs.HeadroomPercent;
     cb->MinGain             = g_knobs.MinGain;
     cb->LiftStrength        = g_knobs.LiftStrength;
@@ -245,7 +306,7 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf,
     cb->DitherActivity      = g_knobs.DitherActivity;
     cb->DitherStrength      = g_knobs.DitherStrength;
     cb->DitherFloor         = g_knobs.DitherFloor;
-    cb->BlackLift           = g_knobs.BlackLift;
+    cb->BlackLift           = surf.BlackLift;
     cb->ShadowToe           = g_knobs.ShadowToe;
     cb->ChromaCorrect       = g_knobs.ChromaCorrect;
     cb->LiftLocality        = g_knobs.LiftLocality;

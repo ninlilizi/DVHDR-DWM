@@ -26,7 +26,10 @@ Three binaries:
   space the game declared through `SetColorSpace1`, else by format, where an
   undeclared 10-bit buffer counts as SDR just as DXGI treats it. SDR surfaces are decoded through
   their gamma curve against the live Windows SDR white level (see `[SDR]` in
-  `dvhdr.ini`) and the output is held below that white. Every opaque swap chain
+  `dvhdr.ini`) and the output is held below that white. Panel capabilities
+  follow the window across monitors through the same `[Display.N]` sections,
+  and an scRGB chain shown on a monitor in SDR mode is rolled off to the
+  80 nits DWM will display. Every opaque swap chain
   in the process gets its own state (a video player's picture chain beside its
   UI toolkit's chain, on separate devices and threads); transparent overlay
   chains are passed through. Partial presentation (Chromium's dirty-rectangle

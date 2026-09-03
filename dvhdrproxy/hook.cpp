@@ -270,22 +270,22 @@ static bool IsHelperProcess()
     return wcsstr(cmd, L"--type=gpu-process") == NULL;
 }
 
-static DWORD WINAPI InstallThread(LPVOID)
+static void InstallHooks()
 {
     if (IsHelperProcess())
     {
         Log_Write("helper process, hooks not installed");
-        return 0;
+        return;
     }
     void *present = NULL, *resize = NULL, *present1 = NULL, *setCsp = NULL, *setMeta = NULL, *exec = NULL;
     if (!GrabSwapChainMethods(&present, &resize, &present1, &setCsp, &setMeta))
     {
         Log_Write("could not create a throwaway swap chain, hooks not installed");
-        return 0;
+        return;
     }
     GrabExecuteCommandLists(&exec);
 
-    if (MH_Initialize() != MH_OK) return 0;
+    if (MH_Initialize() != MH_OK) return;
 
     MH_CreateHook(present,  (LPVOID)Present_hook,       (LPVOID*)&g_presentOrig);
     MH_CreateHook(resize,   (LPVOID)ResizeBuffers_hook, (LPVOID*)&g_resizeOrig);
@@ -297,13 +297,39 @@ static DWORD WINAPI InstallThread(LPVOID)
     MH_EnableHook(MH_ALL_HOOKS);
     Log_Write("hooks installed: Present=%p Present1=%p ResizeBuffers=%p SetColorSpace1=%p SetHDRMetaData=%p ExecuteCommandLists=%p",
               present, present1, resize, setCsp, setMeta, exec);
+}
+
+static HANDLE g_hooksReady      = NULL;   // manual-reset: installation has been attempted, one way or the other
+static DWORD  g_installThreadId = 0;
+
+static DWORD WINAPI InstallThread(LPVOID)
+{
+    g_installThreadId = GetCurrentThreadId();
+    InstallHooks();
+    SetEvent(g_hooksReady);
     return 0;
 }
 
 void Hook_Start()
 {
+    g_hooksReady = CreateEventW(NULL, TRUE, FALSE, NULL);
     HANDLE h = CreateThread(NULL, 0, InstallThread, NULL, 0, NULL);
     if (h) CloseHandle(h);
+    else if (g_hooksReady) SetEvent(g_hooksReady);
+}
+
+// Every swap chain is born of a factory, and every factory comes through the
+// proxy's own exports, so holding those until the hooks are in place means no
+// chain can declare a colour space or present a frame unseen. The installer's
+// own device creation must not wait on itself, and nothing waits for long.
+void Hook_WaitReady()
+{
+    if (!g_hooksReady || GetCurrentThreadId() == g_installThreadId) return;
+    if (WaitForSingleObject(g_hooksReady, 0) == WAIT_OBJECT_0) return;
+    ULONGLONG t0 = GetTickCount64();
+    DWORD r = WaitForSingleObject(g_hooksReady, 5000);
+    Log_Write("factory creation waited %llu ms for the hooks%s", GetTickCount64() - t0,
+              (r == WAIT_OBJECT_0) ? "" : " (timed out)");
 }
 
 void Hook_Stop()
