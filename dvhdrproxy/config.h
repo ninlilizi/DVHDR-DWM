@@ -49,8 +49,14 @@ struct DvhdrCbGpu
     UINT  GamutClip;
     UINT  DitherTemporal;
     float ContentPeak;
+
+    UINT  DitherShape;
+    float DitherWideSpan, DitherWideActivity, DitherHighlightFrom;
+
+    float DitherHighlightBoost;
+    float _pad1, _pad2, _pad3;
 };
-static_assert(sizeof(DvhdrCbGpu) == 192, "cbuffer layout drift");
+static_assert(sizeof(DvhdrCbGpu) == 224, "cbuffer layout drift");
 
 struct DvhdrKnobs
 {
@@ -85,6 +91,11 @@ struct DvhdrKnobs
     float ShadowDesat;            // nits
     int   GamutClip;
     int   DitherTemporal;
+    int   DitherShape;            // 0 uniform / 1 triangular
+    float DitherWideSpan;         // pixels
+    float DitherWideActivity;     // PQ
+    float DitherHighlightFrom;    // nits
+    float DitherHighlightBoost;   // multiplier at the ceiling
 };
 
 extern DvhdrKnobs g_knobs;
@@ -108,7 +119,7 @@ void Config_Load();
 
 // Decide how to treat a swap chain's back buffer: the [Source] override first,
 // then the colour space the game declared through SetColorSpace1, then the
-// format (10-bit UNORM reads as HDR10 only while the display is in HDR mode).
+// format (an undeclared 10-bit UNORM buffer counts as SDR, as DXGI treats it).
 // SDR surfaces also pick up their white level and transfer curve here. Returns
 // false when the surface is one the pass does not handle - caller passes through,
 // and *why (optional) names the reason for the log.

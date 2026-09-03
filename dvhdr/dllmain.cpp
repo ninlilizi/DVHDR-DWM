@@ -370,6 +370,8 @@ struct DvhdrKnobs
     int   BaseDownscale;
     float ShadowDesat;
     int   GamutClip, DitherTemporal;
+    int   DitherShape;
+    float DitherWideSpan, DitherWideActivity, DitherHighlightFrom, DitherHighlightBoost;
 };
 static DvhdrKnobs g_knobs;
 static UINT g_frameIndex = 0;   // walks the temporal dither
@@ -418,8 +420,14 @@ struct DvhdrCbGpu
     UINT  GamutClip;
     UINT  DitherTemporal;
     float ContentPeak;
+
+    UINT  DitherShape;
+    float DitherWideSpan, DitherWideActivity, DitherHighlightFrom;
+
+    float DitherHighlightBoost;
+    float _pad1, _pad2, _pad3;
 };
-static_assert(sizeof(DvhdrCbGpu) == 192, "cbuffer layout drift");
+static_assert(sizeof(DvhdrCbGpu) == 224, "cbuffer layout drift");
 
 static float IniFloat(const char* sec, const char* key, float defVal, const char* path)
 {
@@ -481,6 +489,11 @@ static void LoadKnobsFromIni()
     g_knobs.ShadowDesat         = IniFloat("Color",     "ShadowDesat",          1.0f,    path);
     g_knobs.GamutClip           = GetPrivateProfileIntA("Color",     "GamutClip",           1,        path);
     g_knobs.DitherTemporal      = GetPrivateProfileIntA("Dither",    "Temporal",            1,        path);
+    g_knobs.DitherShape         = GetPrivateProfileIntA("Dither",    "Shape",               1,        path);
+    g_knobs.DitherWideSpan      = IniFloat("Dither",    "WideSpan",             12.0f,   path);
+    g_knobs.DitherWideActivity  = IniFloat("Dither",    "WideActivity",         0.0015f, path);
+    g_knobs.DitherHighlightFrom = IniFloat("Dither",    "HighlightFrom",        200.0f,  path);
+    g_knobs.DitherHighlightBoost= IniFloat("Dither",    "HighlightBoost",       2.0f,    path);
 }
 
 // Resolve each target's panel capabilities. Defaults come from the global
@@ -777,6 +790,11 @@ static void UpdateCbuffer(UINT W, UINT H, const MonitorTarget* tgt, float frameT
     cb.GamutClip           = (g_knobs.GamutClip != 0) ? 1u : 0u;
     cb.DitherTemporal      = (g_knobs.DitherTemporal != 0) ? 1u : 0u;
     cb.ContentPeak         = 0.0f;
+    cb.DitherShape         = (g_knobs.DitherShape != 0) ? 1u : 0u;
+    cb.DitherWideSpan      = g_knobs.DitherWideSpan;
+    cb.DitherWideActivity  = g_knobs.DitherWideActivity;
+    cb.DitherHighlightFrom = g_knobs.DitherHighlightFrom;
+    cb.DitherHighlightBoost = g_knobs.DitherHighlightBoost;
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(g_context->Map(g_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))

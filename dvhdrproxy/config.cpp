@@ -80,6 +80,11 @@ void Config_Load()
     g_knobs.ShadowDesat          = IniFloat("Color",     "ShadowDesat",   1.0f);
     g_knobs.GamutClip            = GetPrivateProfileIntA("Color",       "GamutClip",     1, g_iniPath);
     g_knobs.DitherTemporal       = GetPrivateProfileIntA("Dither",      "Temporal",      1, g_iniPath);
+    g_knobs.DitherShape          = GetPrivateProfileIntA("Dither",      "Shape",         1, g_iniPath);
+    g_knobs.DitherWideSpan       = IniFloat("Dither",    "WideSpan",      12.0f);
+    g_knobs.DitherWideActivity   = IniFloat("Dither",    "WideActivity",  0.0015f);
+    g_knobs.DitherHighlightFrom  = IniFloat("Dither",    "HighlightFrom", 200.0f);
+    g_knobs.DitherHighlightBoost = IniFloat("Dither",    "HighlightBoost", 2.0f);
 }
 
 static bool IsSrgbFormat(DXGI_FORMAT fmt)
@@ -109,16 +114,14 @@ static UINT ColorSpaceFromDeclared(DXGI_COLOR_SPACE_TYPE cs, DXGI_FORMAT fmt)
     }
 }
 
-// Reached only when the game never declared a colour space (or did so before
-// the hook was in place). DXGI's own default for every UNORM format is sRGB;
-// an HDR10 game has to declare G2084 to get PQ out. For 10-bit the display's
-// mode breaks the tie, which also keeps the old always-HDR10 reading whenever
-// HDR is on and the declaration was simply missed.
-static UINT ColorSpaceFromFormat(DXGI_FORMAT fmt, bool hdrMode)
+// Reached only when the game never declared a colour space. DXGI's own default
+// for every UNORM format, 10-bit included, is sRGB: an HDR10 game has to declare
+// G2084 to get PQ out of the compositor at all, so an undeclared 10-bit buffer is
+// an SDR one that merely wanted finer steps. FP16 defaults to scRGB.
+static UINT ColorSpaceFromFormat(DXGI_FORMAT fmt)
 {
     if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) return CSP_SCRGB;
-    if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM)  return hdrMode ? CSP_HDR10 : CSP_SDR;
-    if (IsEightBitFormat(fmt))                 return CSP_SDR;
+    if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM || IsEightBitFormat(fmt)) return CSP_SDR;
     return 0;
 }
 
@@ -169,9 +172,6 @@ bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* ou
 
     if (!Display_IsOpaqueChain(sc)) { *why = "refused: alpha-composed overlay chain"; return false; }
 
-    DisplayState ds = {};
-    bool haveDs = false;
-
     UINT csp = 0;
     if (g_knobs.ColorSpace >= 1 && g_knobs.ColorSpace <= 3)
     {
@@ -182,12 +182,7 @@ bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* ou
         DXGI_COLOR_SPACE_TYPE declared;
         if (Display_GetRecordedColorSpace(sc, &declared))
             csp = ColorSpaceFromDeclared(declared, fmt);
-        if (csp == 0)
-        {
-            bool tenBit = (fmt == DXGI_FORMAT_R10G10B10A2_UNORM);
-            if (tenBit) { ds = Display_Query(sc); haveDs = true; }
-            csp = ColorSpaceFromFormat(fmt, tenBit && ds.HdrMode);
-        }
+        if (csp == 0) csp = ColorSpaceFromFormat(fmt);
     }
     if (csp == 0)
     {
@@ -201,7 +196,7 @@ bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* ou
     out->ColorSpace = csp;
     if (csp == CSP_SDR)
     {
-        if (!haveDs) ds = Display_Query(sc);
+        DisplayState ds = Display_Query(sc);
         out->SdrWhiteNits = ResolveSdrWhite(ds);
         out->SdrGamma     = ResolveSdrGamma(fmt, ds);
         out->SdrSteps     = StepsForFormat(fmt);
@@ -272,4 +267,9 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf,
     cb->GamutClip           = (g_knobs.GamutClip != 0) ? 1u : 0u;
     cb->DitherTemporal      = (g_knobs.DitherTemporal != 0) ? 1u : 0u;
     cb->ContentPeak         = surf.ContentPeak;
+    cb->DitherShape         = (g_knobs.DitherShape != 0) ? 1u : 0u;
+    cb->DitherWideSpan      = g_knobs.DitherWideSpan;
+    cb->DitherWideActivity  = g_knobs.DitherWideActivity;
+    cb->DitherHighlightFrom = g_knobs.DitherHighlightFrom;
+    cb->DitherHighlightBoost = g_knobs.DitherHighlightBoost;
 }

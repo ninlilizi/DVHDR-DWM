@@ -102,6 +102,14 @@ cbuffer DVHDRCb : register(b0)
     uint   GamutClip;       // 1 = hue-preserving clip toward the luminance axis
     uint   DitherTemporal;  // 1 = frame-varying dither pattern
     float  ContentPeak;     // declared content peak (HDR metadata) that seeds adaptation; 0 = none
+
+    uint   DitherShape;         // 0 = uniform noise, 1 = triangular (sum of two uniforms)
+    float  DitherWideSpan;      // pixels: span over which the low-pass base is read for slow gradation
+    float  DitherWideActivity;  // PQ difference across that span at which the dither reaches full strength
+    float  DitherHighlightFrom; // nits: above this the amplitude rises toward the display ceiling
+
+    float  DitherHighlightBoost; // amplitude multiplier reached at the ceiling; 1 = none
+    float  _pad1, _pad2, _pad3;
 };
 
 // ===========================================================================
@@ -711,15 +719,43 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
         float3 pD = linear_to_PQ(saturate(decode_to_nits(SceneTex.SampleLevel(Samp, uv + float2(0.0,  ts.y), 0).rgb, ColorSpace) / 10000.0));
         float3 dev = max(max(abs(pL - pC), abs(pR - pC)), max(abs(pU - pC), abs(pD - pC)));
         float  act  = max(dev.r, max(dev.g, dev.b));         // luma OR chroma variance, in PQ
-        float  actF = lerp(DitherFloor, 1.0, saturate(act / max(DitherActivity, 1e-5)));
-        float  lsb  = DitherStrength * perc_step() * actF;   // one output code step, scaled
+        // A slow ramp is locally flat yet bands the worst, so gradation is also
+        // read across a wider span of the low-pass base.
+        float2 tw   = ts * DitherWideSpan;
+        float  bL   = LumaBlurSRV.SampleLevel(Samp, uv - float2(tw.x, 0.0), 0);
+        float  bR   = LumaBlurSRV.SampleLevel(Samp, uv + float2(tw.x, 0.0), 0);
+        float  bU   = LumaBlurSRV.SampleLevel(Samp, uv - float2(0.0, tw.y), 0);
+        float  bD   = LumaBlurSRV.SampleLevel(Samp, uv + float2(0.0, tw.y), 0);
+        float  wide = max(abs(bR - bL), abs(bD - bU));
+        float  actN = max(act / max(DitherActivity, 1e-5), wide / max(DitherWideActivity, 1e-5));
+        float  actF = lerp(DitherFloor, 1.0, saturate(actN));
 
-        // A frame-varying offset walks the pattern so it averages out over
-        // time instead of sitting still on the panel.
-        float2 dpos  = input.pos.xy + ((DitherTemporal != 0u) ? float(FrameIndex % 64u) * 5.588238 : 0.0);
-        float3 noise = float3(ign(dpos),
-                              ign(dpos + float2(53.0, 17.0)),
-                              ign(dpos + float2(101.0, 71.0))) - 0.5;
+        // Panels step more coarsely toward their peak: the amplitude rises with
+        // luminance from DitherHighlightFrom up to the ceiling.
+        float  boost = (DitherHighlightBoost > 1.0)
+            ? lerp(1.0, DitherHighlightBoost,
+                   smoothstep(nits_to_pq(max(DitherHighlightFrom, 1e-4)), nits_to_pq(max(ceiling, 1.0)), nits_to_pq(Yt)))
+            : 1.0;
+        float  lsb  = DitherStrength * perc_step() * actF * boost;   // peak-to-peak amplitude in output code steps
+
+        // Temporal: a frame-varying offset walks the pattern, and alternate
+        // frames flip its sign so each pair averages to the unquantised value.
+        float2 dpos = input.pos.xy + ((DitherTemporal != 0u) ? float(FrameIndex % 64u) * 5.588238 : 0.0);
+        float3 n1   = float3(ign(dpos), ign(dpos + float2(53.0, 17.0)), ign(dpos + float2(101.0, 71.0)));
+        float3 noise;
+        if (DitherShape != 0u)
+        {
+            // Triangular (TPDF): the sum of two independent uniforms. It decouples
+            // the quantisation error from the signal, so no banding-shaped noise
+            // modulation survives, which uniform noise below one step leaves behind.
+            float3 n2 = float3(ign(dpos + float2(37.0, 89.0)), ign(dpos + float2(151.0, 29.0)), ign(dpos + float2(211.0, 131.0)));
+            noise = (n1 + n2 - 1.0) * 0.5;
+        }
+        else
+        {
+            noise = n1 - 0.5;
+        }
+        if (DitherTemporal != 0u && (FrameIndex & 1u) != 0u) noise = -noise;
 
         if (ColorSpace != CSP_SCRGB)
         {

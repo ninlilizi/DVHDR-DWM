@@ -23,8 +23,8 @@ Three binaries:
   to run the **same** six-pass shader over the game's own back buffer — D3D11
   and D3D12. Handles HDR back buffers (scRGB FP16 / HDR10 R10G10B10A2) and SDR
   ones (gamma-encoded 8/10-bit): each swap chain is classified by the colour
-  space the game declared through `SetColorSpace1`, else by format, with the
-  display's HDR mode breaking the 10-bit tie. SDR surfaces are decoded through
+  space the game declared through `SetColorSpace1`, else by format, where an
+  undeclared 10-bit buffer counts as SDR just as DXGI treats it. SDR surfaces are decoded through
   their gamma curve against the live Windows SDR white level (see `[SDR]` in
   `dvhdr.ini`) and the output is held below that white. Every opaque swap chain
   in the process gets its own state (a video player's picture chain beside its
