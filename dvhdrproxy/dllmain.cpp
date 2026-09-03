@@ -4,6 +4,7 @@
 
 #include "framework.h"
 #include "config.h"
+#include "log.h"
 
 bool Exports_Init();
 void Hook_Start();
@@ -20,6 +21,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/)
         if (!Exports_Init()) return FALSE;   // genuine dxgi missing — fatal
         Config_SetSelfModule(hModule);
         Config_Load();
+        Log_Init(g_knobs.LogEnabled != 0);
         Hook_Start();
         break;
 
@@ -27,6 +29,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/)
         Hook_Stop();
         Effect11_Shutdown();
         Effect12_Shutdown();
+        Log_Shutdown();
         break;
     }
     return TRUE;

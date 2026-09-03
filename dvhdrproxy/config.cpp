@@ -1,12 +1,10 @@
 #include "config.h"
+#include "display.h"
 
 DvhdrKnobs g_knobs;
 
 static HMODULE g_self = NULL;
 static char    g_iniPath[MAX_PATH] = {};
-
-static const UINT CSP_SCRGB = 1u;
-static const UINT CSP_HDR10 = 2u;
 
 void Config_SetSelfModule(HMODULE self)
 {
@@ -25,6 +23,15 @@ static float IniFloat(const char* sec, const char* key, float defVal)
     GetPrivateProfileStringA(sec, key, "", buf, sizeof(buf), g_iniPath);
     if (!buf[0]) return defVal;
     return (float)atof(buf);
+}
+
+// [SDR] Gamma accepts "auto", "sRGB", or a power-law exponent.
+static float IniSdrGamma()
+{
+    char buf[64];
+    GetPrivateProfileStringA("SDR", "Gamma", "", buf, sizeof(buf), g_iniPath);
+    if (buf[0] == 's' || buf[0] == 'S') return -1.0f;
+    return (float)atof(buf);   // blank and "auto" both parse to 0
 }
 
 void Config_Load()
@@ -58,29 +65,153 @@ void Config_Load()
     g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f);
     g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            3.0f);
     g_knobs.DebandRange         = IniFloat("Deband",    "Range",                16.0f);
+    g_knobs.SdrWhiteNits         = IniFloat("SDR",      "WhiteNits",            0.0f);
+    g_knobs.SdrFallbackWhiteNits = IniFloat("SDR",      "FallbackWhiteNits",    200.0f);
+    g_knobs.SdrGamma             = IniSdrGamma();
+    g_knobs.ProcessSDR           = GetPrivateProfileIntA("Source", "ProcessSDR", 1, g_iniPath);
+    g_knobs.LogEnabled           = GetPrivateProfileIntA("Debug",  "Log",        0, g_iniPath);
 }
 
-UINT Config_ColorSpaceForFormat(DXGI_FORMAT fmt)
+static bool IsSrgbFormat(DXGI_FORMAT fmt)
 {
-    if (g_knobs.ColorSpace == 1) return CSP_SCRGB;
-    if (g_knobs.ColorSpace == 2) return CSP_HDR10;
+    return fmt == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+        || fmt == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+        || fmt == DXGI_FORMAT_B8G8R8X8_UNORM_SRGB;
+}
 
-    switch (fmt)
+static bool IsEightBitFormat(DXGI_FORMAT fmt)
+{
+    return fmt == DXGI_FORMAT_R8G8B8A8_UNORM || fmt == DXGI_FORMAT_B8G8R8A8_UNORM
+        || fmt == DXGI_FORMAT_B8G8R8X8_UNORM || IsSrgbFormat(fmt);
+}
+
+// A declaration the format cannot carry is a stale one, left behind when the
+// buffers changed format without a fresh declaration: PQ never sits in 8 bits
+// and scRGB only ever in FP16.
+static UINT ColorSpaceFromDeclared(DXGI_COLOR_SPACE_TYPE cs, DXGI_FORMAT fmt)
+{
+    switch (cs)
     {
-    case DXGI_FORMAT_R16G16B16A16_FLOAT:
-        return CSP_SCRGB;
-    case DXGI_FORMAT_R10G10B10A2_UNORM:
-        return CSP_HDR10;
-    default:
-        return 0; // not an HDR back buffer — pass through
+    case DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020: return IsEightBitFormat(fmt) ? 0 : CSP_HDR10;
+    case DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709:    return (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) ? CSP_SCRGB : 0;
+    case DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709:    return CSP_SDR;
+    default:                                         return 0; // studio range / YCbCr / 2020 SDR: let the format decide
     }
 }
 
-void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, UINT colorSpace, float frameTimeMs)
+// Reached only when the game never declared a colour space (or did so before
+// the hook was in place). DXGI's own default for every UNORM format is sRGB;
+// an HDR10 game has to declare G2084 to get PQ out. For 10-bit the display's
+// mode breaks the tie, which also keeps the old always-HDR10 reading whenever
+// HDR is on and the declaration was simply missed.
+static UINT ColorSpaceFromFormat(DXGI_FORMAT fmt, bool hdrMode)
+{
+    if (fmt == DXGI_FORMAT_R16G16B16A16_FLOAT) return CSP_SCRGB;
+    if (fmt == DXGI_FORMAT_R10G10B10A2_UNORM)  return hdrMode ? CSP_HDR10 : CSP_SDR;
+    if (IsEightBitFormat(fmt))                 return CSP_SDR;
+    return 0;
+}
+
+static float ResolveSdrWhite(const DisplayState& ds)
+{
+    if (g_knobs.SdrWhiteNits > 0.0f) return g_knobs.SdrWhiteNits;
+    if (ds.HdrMode && ds.SdrWhiteNits > 0.0f) return ds.SdrWhiteNits;
+    return (g_knobs.SdrFallbackWhiteNits > 0.0f) ? g_knobs.SdrFallbackWhiteNits : 200.0f;
+}
+
+// Windows composes an SDR chain onto an HDR display through the piecewise sRGB
+// curve; a panel driven natively in SDR tracks a 2.2 power law. An _SRGB view
+// decodes and re-encodes in hardware, so the shader sees linear light there.
+static float ResolveSdrGamma(DXGI_FORMAT fmt, const DisplayState& ds)
+{
+    if (IsSrgbFormat(fmt))       return 1.0f;
+    if (g_knobs.SdrGamma < 0.0f) return 0.0f;
+    if (g_knobs.SdrGamma > 0.0f) return g_knobs.SdrGamma;
+    return ds.HdrMode ? 0.0f : 2.2f;
+}
+
+// Video overlay chains carry YUV planes that the display hardware converts and
+// blends itself; there is no RGB surface to tonemap.
+static bool IsYuvFormat(DXGI_FORMAT fmt)
+{
+    switch (fmt)
+    {
+    case DXGI_FORMAT_NV12: case DXGI_FORMAT_P010: case DXGI_FORMAT_P016:
+    case DXGI_FORMAT_420_OPAQUE: case DXGI_FORMAT_YUY2: case DXGI_FORMAT_AYUV:
+    case DXGI_FORMAT_Y410: case DXGI_FORMAT_Y416: case DXGI_FORMAT_Y210: case DXGI_FORMAT_Y216:
+    case DXGI_FORMAT_NV11: case DXGI_FORMAT_P208: case DXGI_FORMAT_V208: case DXGI_FORMAT_V408:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static float StepsForFormat(DXGI_FORMAT fmt)
+{
+    return IsEightBitFormat(fmt) ? 255.0f : 1023.0f;
+}
+
+bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* out, const char** why)
+{
+    const char* dummy;
+    if (!why) why = &dummy;
+    *why = NULL;
+
+    if (!Display_IsOpaqueChain(sc)) { *why = "refused: alpha-composed overlay chain"; return false; }
+
+    DisplayState ds = {};
+    bool haveDs = false;
+
+    UINT csp = 0;
+    if (g_knobs.ColorSpace >= 1 && g_knobs.ColorSpace <= 3)
+    {
+        csp = (UINT)g_knobs.ColorSpace;
+    }
+    else
+    {
+        DXGI_COLOR_SPACE_TYPE declared;
+        if (Display_GetRecordedColorSpace(sc, &declared))
+            csp = ColorSpaceFromDeclared(declared, fmt);
+        if (csp == 0)
+        {
+            bool tenBit = (fmt == DXGI_FORMAT_R10G10B10A2_UNORM);
+            if (tenBit) { ds = Display_Query(sc); haveDs = true; }
+            csp = ColorSpaceFromFormat(fmt, tenBit && ds.HdrMode);
+        }
+    }
+    if (csp == 0)
+    {
+        *why = IsYuvFormat(fmt) ? "refused: YUV video overlay chain, composed by the display hardware"
+                                : "refused: format not handled";
+        return false;
+    }
+    if (csp == CSP_SDR && !g_knobs.ProcessSDR) { *why = "refused: SDR processing disabled"; return false; }
+
+    *out = {};
+    out->ColorSpace = csp;
+    if (csp == CSP_SDR)
+    {
+        if (!haveDs) ds = Display_Query(sc);
+        out->SdrWhiteNits = ResolveSdrWhite(ds);
+        out->SdrGamma     = ResolveSdrGamma(fmt, ds);
+        out->SdrSteps     = StepsForFormat(fmt);
+    }
+    return true;
+}
+
+void Config_DescribeSurface(const SurfaceInfo& surf, char* buf, size_t n)
+{
+    if (surf.ColorSpace == CSP_SDR)
+        snprintf(buf, n, "applied: SDR white=%.0f gamma=%.2f steps=%.0f", surf.SdrWhiteNits, surf.SdrGamma, surf.SdrSteps);
+    else
+        snprintf(buf, n, "applied: %s", (surf.ColorSpace == CSP_HDR10) ? "HDR10" : "scRGB");
+}
+
+void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf, float frameTimeMs)
 {
     cb->BufferW             = w;
     cb->BufferH             = h;
-    cb->ColorSpace          = colorSpace;
+    cb->ColorSpace          = surf.ColorSpace;
     cb->FrameTimeMs         = frameTimeMs;
     cb->DisplayPeak         = g_knobs.DisplayPeak;
     cb->DisplayMaxFALL      = g_knobs.DisplayMaxFALL;
@@ -110,4 +241,8 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, UINT colorSpace, float f
     cb->LiftLocality        = g_knobs.LiftLocality;
     cb->DebandThreshold     = g_knobs.DebandThreshold;
     cb->DebandRange         = g_knobs.DebandRange;
+    cb->SdrWhiteNits        = surf.SdrWhiteNits;
+    cb->SdrGamma            = surf.SdrGamma;
+    cb->SdrSteps            = surf.SdrSteps;
+    cb->PreserveAlpha       = 1u;   // a game's own alpha passes through untouched
 }

@@ -102,6 +102,8 @@
     <ClInclude Include="config.h" />
     <ClInclude Include="effect_d3d11.h" />
     <ClInclude Include="effect_d3d12.h" />
+    <ClInclude Include="display.h" />
+    <ClInclude Include="log.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="dllmain.cpp" />
@@ -110,6 +112,8 @@
     <ClCompile Include="hook.cpp" />
     <ClCompile Include="effect_d3d11.cpp" />
     <ClCompile Include="effect_d3d12.cpp" />
+    <ClCompile Include="display.cpp" />
+    <ClCompile Include="log.cpp" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="forwarders.asm" />

@@ -40,11 +40,12 @@
 
 static const uint CSP_SCRGB = 1u;
 static const uint CSP_HDR10 = 2u;
+static const uint CSP_SDR   = 3u;   // gamma-encoded BT.709: 8/10-bit UNORM, or FP16 declared G22
 
 cbuffer DVHDRCb : register(b0)
 {
     uint2  BufferSize;            // BUFFER_WIDTH, BUFFER_HEIGHT
-    uint   ColorSpace;            // CSP_SCRGB | CSP_HDR10
+    uint   ColorSpace;            // CSP_SCRGB | CSP_HDR10 | CSP_SDR
     float  FrameTimeMs;           // ReShade's <source="frametime">
 
     float  DisplayPeak;
@@ -81,6 +82,11 @@ cbuffer DVHDRCb : register(b0)
     float  LiftLocality;    // 0 = region lift (contrast-preserving), 1 = per-pixel lift
     float  DebandThreshold; // source deband sensitivity, 10-bit PQ code steps; 0 = off
     float  DebandRange;     // deband sample radius (pixels)
+
+    float  SdrWhiteNits;    // CSP_SDR: luminance of code 1.0 once the panel shows it
+    float  SdrGamma;        // CSP_SDR: 0 = sRGB piecewise, else the power-law exponent (1 = linear, for _SRGB views)
+    float  SdrSteps;        // CSP_SDR: code steps in the back buffer (255 / 1023)
+    uint   PreserveAlpha;   // 1 = carry the source alpha through (proxy); 0 = write opaque (DWM)
 };
 
 // ===========================================================================
@@ -99,7 +105,8 @@ RWTexture2D<float4>   AdaptUAV      : register(u1);
 SamplerState          Samp          : register(s0);
 
 // ===========================================================================
-//  Colour-space helpers — verbatim from DVHDR.fx (algorithmically identical)
+//  Colour-space helpers - from DVHDR.fx (algorithmically identical), plus an
+//  SDR gamma path that has no ReShade counterpart
 // ===========================================================================
 
 static const float PQ_m1 = 0.1593017578125;
@@ -134,16 +141,44 @@ float pq_to_nits(float e)
     return PQ_to_linear(saturate(e).xxx).x * 10000.0;
 }
 
+// SDR transfer functions. Piecewise sRGB is how Windows composes an SDR swap
+// chain onto an HDR display; a plain power law matches a panel driven natively
+// in SDR. The same curve is used both ways, so Strength 0 stays an identity.
+float3 sdr_to_linear(float3 v)
+{
+    v = saturate(v);
+    if (SdrGamma > 0.0) return pow(v, SdrGamma);
+    return (v <= 0.04045) ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4);
+}
+
+float3 linear_to_sdr(float3 l)
+{
+    l = saturate(l);
+    if (SdrGamma > 0.0) return pow(l, 1.0 / SdrGamma);
+    return (l <= 0.0031308) ? l * 12.92 : 1.055 * pow(l, 1.0 / 2.4) - 0.055;
+}
+
 float3 decode_to_nits(float3 c, uint csp)
 {
     if (csp == CSP_HDR10) return PQ_to_linear(saturate(c)) * 10000.0;
+    if (csp == CSP_SDR)   return sdr_to_linear(c) * SdrWhiteNits;
     return c * 80.0;
 }
 
 float3 encode_from_nits(float3 n, uint csp)
 {
     if (csp == CSP_HDR10) return linear_to_PQ(saturate(n / 10000.0));
+    if (csp == CSP_SDR)   return linear_to_sdr(n / max(SdrWhiteNits, 1e-4));
     return n / 80.0;
+}
+
+// Brightest value the output surface can carry: an HDR surface reaches the
+// panel's peak, an SDR buffer stops at its white. The governor target, the
+// rolloff and the black-lift remap all aim here, so a lift never pushes an SDR
+// surface past code 1.0.
+float output_ceiling()
+{
+    return (ColorSpace == CSP_SDR) ? min(DisplayPeak, SdrWhiteNits) : DisplayPeak;
 }
 
 float luminance(float3 n, uint csp)
@@ -261,13 +296,18 @@ float3 dice_recombine(float3 linNits, float Ysrc, float Yt, uint csp, float chro
 //  more it is genuine detail / an edge and is kept. The threshold IS the detector.
 // ===========================================================================
 
-float3 src_to_pq(float3 c) { return linear_to_PQ(saturate(decode_to_nits(c, ColorSpace) / 10000.0)); }
-float3 pq_to_src(float3 p) { return encode_from_nits(PQ_to_linear(saturate(p)) * 10000.0, ColorSpace); }
+// Deband working domain: PQ for HDR surfaces (threshold in 10-bit PQ steps). An
+// SDR buffer's own gamma encoding is already near-perceptual and is where its
+// quantisation lives, so its codes are compared directly and the threshold
+// counts the buffer's own steps.
+float3 src_to_perc(float3 c) { return (ColorSpace == CSP_SDR) ? saturate(c) : linear_to_PQ(saturate(decode_to_nits(c, ColorSpace) / 10000.0)); }
+float3 perc_to_src(float3 p) { return (ColorSpace == CSP_SDR) ? p : encode_from_nits(PQ_to_linear(saturate(p)) * 10000.0, ColorSpace); }
+float  perc_step()           { return (ColorSpace == CSP_SDR) ? 1.0 / max(SdrSteps, 1.0) : 1.0 / 1023.0; }
 
 float3 deband_source(float2 uv, float2 pos, float2 ts)
 {
-    float3 c   = src_to_pq(SceneTex.SampleLevel(Samp, uv, 0).rgb);
-    float  thr = DebandThreshold / 1023.0;             // code steps -> PQ
+    float3 c   = src_to_perc(SceneTex.SampleLevel(Samp, uv, 0).rgb);
+    float  thr = DebandThreshold * perc_step();        // source code steps
     float3 sum = c;
     float3 mx  = float3(0.0, 0.0, 0.0);
 
@@ -278,17 +318,17 @@ float3 deband_source(float2 uv, float2 pos, float2 ts)
         float  r   = DebandRange * (float(i) / 2.0);
         float2 d   = float2(cos(ang), sin(ang)) * r * ts;
         float2 q   = float2(-d.y, d.x);                // perpendicular
-        float3 s0 = src_to_pq(SceneTex.SampleLevel(Samp, uv + d, 0).rgb);
-        float3 s1 = src_to_pq(SceneTex.SampleLevel(Samp, uv - d, 0).rgb);
-        float3 s2 = src_to_pq(SceneTex.SampleLevel(Samp, uv + q, 0).rgb);
-        float3 s3 = src_to_pq(SceneTex.SampleLevel(Samp, uv - q, 0).rgb);
+        float3 s0 = src_to_perc(SceneTex.SampleLevel(Samp, uv + d, 0).rgb);
+        float3 s1 = src_to_perc(SceneTex.SampleLevel(Samp, uv - d, 0).rgb);
+        float3 s2 = src_to_perc(SceneTex.SampleLevel(Samp, uv + q, 0).rgb);
+        float3 s3 = src_to_perc(SceneTex.SampleLevel(Samp, uv - q, 0).rgb);
         sum += s0 + s1 + s2 + s3;
         mx   = max(mx, max(max(abs(s0 - c), abs(s1 - c)), max(abs(s2 - c), abs(s3 - c))));
     }
 
     float3 avg = sum / 9.0;
     float3 t   = saturate(mx / max(thr, 1e-6));        // 0 = flat -> avg, 1 = detail -> keep
-    return pq_to_src(lerp(avg, c, t));
+    return perc_to_src(lerp(avg, c, t));
 }
 
 // ===========================================================================
@@ -444,17 +484,20 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
     float2 uv  = input.uv;
     int2   px  = int2(input.pos.xy);
 
+    float4 srcPx = SceneTex.SampleLevel(Samp, uv, 0);
     float3 src   = (DebandThreshold > 0.0)
         ? deband_source(uv, input.pos.xy, float2(1.0 / BufferSize.x, 1.0 / BufferSize.y))
-        : SceneTex.SampleLevel(Samp, uv, 0).rgb;
+        : srcPx.rgb;
+    float  outA  = (PreserveAlpha != 0u) ? srcPx.a : 1.0;
     float4 ad    = AdaptSRV.Load(int3(0, 0, 0));
     float  adPeak = ad.x;
     float  adFall = ad.y;
 
-    float targetFall = DisplayMaxFALL * (HeadroomPercent * 0.01);
+    float ceiling    = output_ceiling();
+    float targetFall = min(DisplayMaxFALL, ceiling) * (HeadroomPercent * 0.01);
     float ratio      = targetFall / max(adFall, 0.01);
     float g = (ratio < 1.0) ? max(ratio, MinGain)
-                            : min(pow(ratio, LiftStrength), MaxGain);
+                            : min(pow(max(ratio, 1.0), LiftStrength), MaxGain);
 
     float3 lin  = decode_to_nits(src, ColorSpace);
     float  Ysrc = luminance(lin, ColorSpace);
@@ -508,7 +551,7 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
     float Ylc = pq_to_nits(pqOut);
 
     float Yt = (UseHighlightRolloff != 0)
-                 ? bt2390_eetf(Ylc, adPeak * min(g, 1.0), DisplayPeak, DisplayBlack)
+                 ? bt2390_eetf(Ylc, adPeak * min(g, 1.0), ceiling, DisplayBlack)
                  : Ylc;
 
     float3 outNits = dice_recombine(lin, Ysrc, Yt, ColorSpace, ChromaCorrect);
@@ -517,15 +560,15 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
     // Black-level lift — applied as an absolute floor on the FINAL output, after
     // the Strength crossfade, so nothing (a partial-strength blend back toward
     // the untouched source, or the dynamic/local-contrast stages above) can sit
-    // below it. Affine remap [0, DisplayPeak] -> [BlackLift, DisplayPeak] in
-    // nits: peak-preserving (per-channel MaxCLL stays at DisplayPeak), the
+    // below it. Affine remap [0, ceiling] -> [BlackLift, ceiling] in
+    // nits: peak-preserving (per-channel MaxCLL stays at the ceiling), the
     // darkest pixels rise to a faint neutral grey, and being affine (not a
     // ratio) it is safe on pure black. For panels that crush detail right at the
     // bottom of their range.
     if (BlackLift > 0.0)
     {
         float3 fn = decode_to_nits(outc, ColorSpace);
-        outc = encode_from_nits(BlackLift + fn * (1.0 - BlackLift / max(DisplayPeak, 1.0)), ColorSpace);
+        outc = encode_from_nits(BlackLift + fn * (1.0 - BlackLift / max(ceiling, 1.0)), ColorSpace);
     }
 
     // Output dither — break the panel's quantisation banding at all levels, in
@@ -533,7 +576,8 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
     // step, so the amplitude tracks the quantiser at every level rather than
     // only in highlights. Gated by local neighbourhood activity in ANY channel,
     // so flat fields stay clean while every region containing gradation (where
-    // banding shows) is broken up. DitherStrength = 10-bit code steps;
+    // banding shows) is broken up. DitherStrength = code steps of the output
+    // surface (10-bit PQ for HDR, the buffer's own depth for SDR);
     // DitherActivity = PQ variance for full strength; DitherFloor = baseline.
     if (DitherStrength > 0.0)
     {
@@ -546,15 +590,15 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
         float3 dev = max(max(abs(pL - pC), abs(pR - pC)), max(abs(pU - pC), abs(pD - pC)));
         float  act  = max(dev.r, max(dev.g, dev.b));         // luma OR chroma variance, in PQ
         float  actF = lerp(DitherFloor, 1.0, saturate(act / max(DitherActivity, 1e-5)));
-        float  lsb  = (DitherStrength / 1023.0) * actF;      // one PQ code step, scaled
+        float  lsb  = DitherStrength * perc_step() * actF;   // one output code step, scaled
 
         float3 noise = float3(ign(input.pos.xy),
                               ign(input.pos.xy + float2(53.0, 17.0)),
                               ign(input.pos.xy + float2(101.0, 71.0))) - 0.5;
 
-        if (ColorSpace == CSP_HDR10)
+        if (ColorSpace != CSP_SCRGB)
         {
-            outc = saturate(outc + noise * lsb);             // output is PQ — perturb directly
+            outc = saturate(outc + noise * lsb);             // output is code-encoded (PQ or gamma): perturb directly
         }
         else
         {
@@ -607,5 +651,5 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
         }
     }
 
-    return float4(outc, 1.0);
+    return float4(outc, outA);
 }

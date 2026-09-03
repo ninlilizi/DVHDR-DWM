@@ -1,14 +1,16 @@
 // hook.cpp — installs the Present interception. dxgi swap chains (whether the
 // game drives them through D3D11 or D3D12) share one vtable implemented in
 // dxgi.dll, so a single throwaway D3D11 swap chain yields the code addresses of
-// Present / Present1 / ResizeBuffers, and MinHook then catches every swap chain
-// in the process. A throwaway D3D12 queue gives ExecuteCommandLists, which we
-// hook only to learn which DIRECT queue the game presents through (D3D12 has no
-// way to recover the queue from the swap chain).
+// Present / Present1 / ResizeBuffers / SetColorSpace1, and MinHook then catches
+// every swap chain in the process. A throwaway D3D12 queue gives
+// ExecuteCommandLists, which we hook only to learn which DIRECT queue the game
+// presents through (D3D12 has no way to recover the queue from the swap chain).
 
 #include "framework.h"
 #include "effect_d3d11.h"
 #include "effect_d3d12.h"
+#include "display.h"
+#include "log.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d12.lib")
@@ -17,39 +19,89 @@
 typedef HRESULT (STDMETHODCALLTYPE* Present_t)(IDXGISwapChain*, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE* Present1_t)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 typedef HRESULT (STDMETHODCALLTYPE* ResizeBuffers_t)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
+typedef HRESULT (STDMETHODCALLTYPE* SetColorSpace1_t)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
 typedef void    (STDMETHODCALLTYPE* ExecuteCommandLists_t)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
 static Present_t             g_presentOrig             = NULL;
 static Present1_t            g_present1Orig            = NULL;
 static ResizeBuffers_t       g_resizeOrig              = NULL;
+static SetColorSpace1_t      g_setColorSpaceOrig       = NULL;
 static ExecuteCommandLists_t g_execOrig                = NULL;
 
-// SEH-guarded effect application — never let a fault in our pass crash the game.
-static void SafeApply(IDXGISwapChain* sc)
+// Present and ResizeBuffers arrive from whichever threads the application
+// drives its swap chains on; the effect state is only ever touched under this.
+static SRWLOCK g_fxLock = SRWLOCK_INIT;
+
+// SEH-guarded effect application - never let a fault in our pass crash the game.
+// Returns true when the back buffer was rewritten.
+static bool SafeApply(IDXGISwapChain* sc, const DXGI_PRESENT_PARAMETERS* present)
 {
-    __try { if (!Effect11_Apply(sc)) Effect12_Apply(sc); }
+    bool applied = false;
+    AcquireSRWLockExclusive(&g_fxLock);
+    __try { applied = Effect11_Apply(sc, present) || Effect12_Apply(sc, present); }
     __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ReleaseSRWLockExclusive(&g_fxLock);
+    return applied;
 }
 
 static HRESULT STDMETHODCALLTYPE Present_hook(IDXGISwapChain* sc, UINT sync, UINT flags)
 {
-    if (!(flags & DXGI_PRESENT_TEST)) SafeApply(sc);
+    if (!(flags & DXGI_PRESENT_TEST)) SafeApply(sc, NULL);
     return g_presentOrig(sc, sync, flags);
 }
 
 static HRESULT STDMETHODCALLTYPE Present1_hook(IDXGISwapChain1* sc, UINT sync, UINT flags,
                                               const DXGI_PRESENT_PARAMETERS* params)
 {
-    if (!(flags & DXGI_PRESENT_TEST)) SafeApply(sc);
+    if (!(flags & DXGI_PRESENT_TEST) && SafeApply(sc, params) && params)
+    {
+        // The pass rewrote the whole back buffer, so the whole frame is what
+        // must reach the screen: a dirty-rectangle present would let DXGI stitch
+        // the previous frame back in around them.
+        DXGI_PRESENT_PARAMETERS whole = {};
+        return g_present1Orig(sc, sync, flags, &whole);
+    }
     return g_present1Orig(sc, sync, flags, params);
+}
+
+// A colour space declared for the old buffers means nothing once they change
+// format; forget it so the next Present classifies the new ones afresh.
+static void ForgetStaleDeclaration(IDXGISwapChain* sc, DXGI_FORMAT requested)
+{
+    if (requested == DXGI_FORMAT_UNKNOWN) return;   // keep the current format
+    DXGI_SWAP_CHAIN_DESC d;
+    if (SUCCEEDED(sc->GetDesc(&d)) && d.BufferDesc.Format != requested)
+    {
+        Display_ClearRecordedColorSpace(sc);
+        Log_Write("chain %p: ResizeBuffers changes format %d -> %d, declaration forgotten", sc, (int)d.BufferDesc.Format, (int)requested);
+    }
 }
 
 static HRESULT STDMETHODCALLTYPE ResizeBuffers_hook(IDXGISwapChain* sc, UINT count, UINT w, UINT h,
                                                    DXGI_FORMAT fmt, UINT flags)
 {
-    Effect11_OnResize();
-    Effect12_OnResize();
+    Log_Write("chain %p: ResizeBuffers count=%u %ux%u fmt=%d flags=0x%x", sc, count, w, h, (int)fmt, flags);
+    AcquireSRWLockExclusive(&g_fxLock);
+    __try
+    {
+        ForgetStaleDeclaration(sc, fmt);
+        Effect11_OnResize(sc);
+        Effect12_OnResize(sc);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {}
+    ReleaseSRWLockExclusive(&g_fxLock);
     return g_resizeOrig(sc, count, w, h, fmt, flags);
+}
+
+// The declaration is the one authoritative statement of what the back buffer
+// holds; remember it on the swap chain so classification need not guess from
+// the format alone.
+static HRESULT STDMETHODCALLTYPE SetColorSpace1_hook(IDXGISwapChain3* sc, DXGI_COLOR_SPACE_TYPE cs)
+{
+    HRESULT hr = g_setColorSpaceOrig(sc, cs);
+    if (SUCCEEDED(hr)) Display_RecordColorSpace(sc, cs);
+    Log_Write("chain %p: SetColorSpace1(%d) hr=0x%08x", sc, (int)cs, (unsigned)hr);
+    return hr;
 }
 
 static void STDMETHODCALLTYPE ExecuteCommandLists_hook(ID3D12CommandQueue* q, UINT n,
@@ -76,32 +128,69 @@ static HWND MakeDummyWindow()
                            0, 0, 1, 1, NULL, NULL, GetModuleHandleW(NULL), NULL);
 }
 
-// Read Present (8), ResizeBuffers (13), Present1 (22) from a throwaway D3D11
-// swap chain's vtable.
-static bool GrabSwapChainMethods(void** outPresent, void** outResize, void** outPresent1)
+// A throwaway swap chain whose vtable we can read. A windowless composition
+// chain is tried first: it needs no user32 window, which a sandboxed process (a
+// browser's GPU process) is forbidden to create. A window-bound chain is the
+// fallback for systems without DXGI 1.2.
+static IDXGISwapChain* MakeThrowawayChain(ID3D11Device* dev, HWND* outWnd)
 {
-    HWND hwnd = MakeDummyWindow();
-    if (!hwnd) return false;
+    IDXGISwapChain* sc = NULL;
+    *outWnd = NULL;
 
-    DXGI_SWAP_CHAIN_DESC scd = {};
-    scd.BufferCount = 2;
-    scd.BufferDesc.Width = 1; scd.BufferDesc.Height = 1;
-    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-    scd.OutputWindow = hwnd;
-    scd.SampleDesc.Count = 1;
-    scd.Windowed = TRUE;
-    scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    IDXGIDevice*   dxgiDev = NULL;
+    IDXGIAdapter*  adapter = NULL;
+    IDXGIFactory2* factory = NULL;
+    if (SUCCEEDED(dev->QueryInterface(IID_PPV_ARGS(&dxgiDev))) && dxgiDev
+        && SUCCEEDED(dxgiDev->GetAdapter(&adapter)) && adapter
+        && SUCCEEDED(adapter->GetParent(IID_PPV_ARGS(&factory))) && factory)
+    {
+        DXGI_SWAP_CHAIN_DESC1 d = {};
+        d.Width = 8; d.Height = 8;
+        d.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        d.SampleDesc.Count = 1;
+        d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        d.BufferCount = 2;
+        d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL;
+        d.AlphaMode = DXGI_ALPHA_MODE_PREMULTIPLIED;
+        IDXGISwapChain1* sc1 = NULL;
+        if (SUCCEEDED(factory->CreateSwapChainForComposition(dev, &d, NULL, &sc1)) && sc1)
+            sc = sc1;
 
+        if (!sc)
+        {
+            *outWnd = MakeDummyWindow();
+            if (*outWnd)
+            {
+                d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
+                if (SUCCEEDED(factory->CreateSwapChainForHwnd(dev, *outWnd, &d, NULL, NULL, &sc1)) && sc1)
+                    sc = sc1;
+            }
+        }
+    }
+    if (factory) factory->Release();
+    if (adapter) adapter->Release();
+    if (dxgiDev) dxgiDev->Release();
+    return sc;
+}
+
+// Read Present (8), ResizeBuffers (13), Present1 (22) and SetColorSpace1 (38, via
+// IDXGISwapChain3) from a throwaway swap chain's vtable.
+static bool GrabSwapChainMethods(void** outPresent, void** outResize, void** outPresent1, void** outSetColorSpace)
+{
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
-    IDXGISwapChain*      sc  = NULL;
     ID3D11Device*        dev = NULL;
     ID3D11DeviceContext* ctx = NULL;
-    HRESULT hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
-                     &fl, 1, D3D11_SDK_VERSION, &scd, &sc, &dev, NULL, &ctx);
-    if (FAILED(hr) || !sc)
+    if (FAILED(D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, &fl, 1, D3D11_SDK_VERSION,
+                                 &dev, NULL, &ctx)) || !dev)
+        return false;
+
+    HWND hwnd = NULL;
+    IDXGISwapChain* sc = MakeThrowawayChain(dev, &hwnd);
+    if (!sc)
     {
-        DestroyWindow(hwnd);
+        if (ctx) ctx->Release();
+        dev->Release();
+        if (hwnd) DestroyWindow(hwnd);
         return false;
     }
 
@@ -110,10 +199,18 @@ static bool GrabSwapChainMethods(void** outPresent, void** outResize, void** out
     *outResize   = vt[13];
     *outPresent1 = vt[22];
 
-    if (ctx) ctx->Release();
-    if (dev) dev->Release();
+    *outSetColorSpace = NULL;
+    IDXGISwapChain3* sc3 = NULL;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc3))) && sc3)
+    {
+        *outSetColorSpace = (*(void***)sc3)[38];
+        sc3->Release();
+    }
+
     sc->Release();
-    DestroyWindow(hwnd);
+    if (ctx) ctx->Release();
+    dev->Release();
+    if (hwnd) DestroyWindow(hwnd);
     return true;
 }
 
@@ -138,11 +235,28 @@ static void GrabExecuteCommandLists(void** out)
     dev->Release();
 }
 
+// A Chromium-style helper process (renderer, utility, network...) never
+// presents; only the GPU process and the main process are worth hooking.
+static bool IsHelperProcess()
+{
+    const wchar_t* cmd = GetCommandLineW();
+    if (!cmd || !wcsstr(cmd, L"--type=")) return false;
+    return wcsstr(cmd, L"--type=gpu-process") == NULL;
+}
+
 static DWORD WINAPI InstallThread(LPVOID)
 {
-    void *present = NULL, *resize = NULL, *present1 = NULL, *exec = NULL;
-    if (!GrabSwapChainMethods(&present, &resize, &present1))
+    if (IsHelperProcess())
+    {
+        Log_Write("helper process, hooks not installed");
         return 0;
+    }
+    void *present = NULL, *resize = NULL, *present1 = NULL, *setCsp = NULL, *exec = NULL;
+    if (!GrabSwapChainMethods(&present, &resize, &present1, &setCsp))
+    {
+        Log_Write("could not create a throwaway swap chain, hooks not installed");
+        return 0;
+    }
     GrabExecuteCommandLists(&exec);
 
     if (MH_Initialize() != MH_OK) return 0;
@@ -150,9 +264,12 @@ static DWORD WINAPI InstallThread(LPVOID)
     MH_CreateHook(present,  (LPVOID)Present_hook,       (LPVOID*)&g_presentOrig);
     MH_CreateHook(resize,   (LPVOID)ResizeBuffers_hook, (LPVOID*)&g_resizeOrig);
     if (present1) MH_CreateHook(present1, (LPVOID)Present1_hook, (LPVOID*)&g_present1Orig);
+    if (setCsp)   MH_CreateHook(setCsp,   (LPVOID)SetColorSpace1_hook, (LPVOID*)&g_setColorSpaceOrig);
     if (exec)     MH_CreateHook(exec,    (LPVOID)ExecuteCommandLists_hook, (LPVOID*)&g_execOrig);
 
     MH_EnableHook(MH_ALL_HOOKS);
+    Log_Write("hooks installed: Present=%p Present1=%p ResizeBuffers=%p SetColorSpace1=%p ExecuteCommandLists=%p",
+              present, present1, resize, setCsp, exec);
     return 0;
 }
 

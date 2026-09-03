@@ -392,8 +392,13 @@ struct DvhdrCbGpu
     float ChromaCorrect;
     float LiftLocality;
     float DebandThreshold, DebandRange;
+
+    // Proxy-only fields (SDR surfaces, alpha passthrough); DWM always composes
+    // opaque FP16 scRGB, so these stay zero here.
+    float SdrWhiteNits, SdrGamma, SdrSteps;
+    UINT  PreserveAlpha;
 };
-static_assert(sizeof(DvhdrCbGpu) == 128, "cbuffer layout drift");
+static_assert(sizeof(DvhdrCbGpu) == 144, "cbuffer layout drift");
 
 static float IniFloat(const char* sec, const char* key, float defVal, const char* path)
 {

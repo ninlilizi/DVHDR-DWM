@@ -19,9 +19,17 @@ Three binaries:
   directory is searched first), forwards all 20 genuine DXGI exports to
   `C:\Windows\System32\dxgi.dll`, and hooks `IDXGISwapChain::Present`/`Present1`
   to run the **same** six-pass shader over the game's own back buffer — D3D11
-  and D3D12. Engages only on HDR back buffers (scRGB FP16 / HDR10 R10G10B10A2);
-  SDR games pass through untouched. Built by the `dvhdrproxy` project; the shader
-  source (`dvhdr_dwm.hlsl`) is shared with the DWM payload, so both stay in step.
+  and D3D12. Handles HDR back buffers (scRGB FP16 / HDR10 R10G10B10A2) and SDR
+  ones (gamma-encoded 8/10-bit): each swap chain is classified by the colour
+  space the game declared through `SetColorSpace1`, else by format, with the
+  display's HDR mode breaking the 10-bit tie. SDR surfaces are decoded through
+  their gamma curve against the live Windows SDR white level (see `[SDR]` in
+  `dvhdr.ini`) and the output is held below that white. Every opaque swap chain
+  in the process gets its own state (a video player's picture chain beside its
+  UI toolkit's chain, on separate devices and threads); transparent overlay
+  chains are passed through. Built by the
+  `dvhdrproxy` project; the shader source (`dvhdr_dwm.hlsl`) is shared with the
+  DWM payload, so both stay in step.
 
 The hook scaffolding (AOB scan, DirectFlip suppression, per-monitor keying via
 `DeviceClipBox`) is forked from
