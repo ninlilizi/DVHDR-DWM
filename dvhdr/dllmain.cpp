@@ -113,6 +113,89 @@ bool isWindows11_25h2 = false;
 // disables DirectFlip/MPO process-wide.
 static int* g_pOverlayTestMode = NULL;
 
+// ===========================================================================
+// TEMPORARY diagnostics - remove after offset/version triage. Every line is
+// written to C:\Windows\Temp\dvhdr-shader.log (falling back to DWM's own %TEMP%
+// if that path is not writable) and mirrored to OutputDebugString, so it can be
+// captured live with Sysinternals DebugView ("Capture Global Win32"). Per-frame
+// call sites are throttled so they cannot flood.
+// ===========================================================================
+static CRITICAL_SECTION g_dbgCs;
+static bool             g_dbgReady = false;
+
+static void DbgLog(const char* fmt, ...)
+{
+    char body[480];
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+
+    char line[560];
+    SYSTEMTIME st; GetLocalTime(&st);
+    int n = wsprintfA(line, "[%02d:%02d:%02d.%03d] ", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    lstrcpynA(line + n, body, (int)sizeof(line) - n - 2);
+    lstrcatA(line, "\n");
+
+    OutputDebugStringA(line);
+
+    static char logpath[MAX_PATH]; static int mode = -1;
+    if (mode == -1)
+    {
+        mode = 0;
+        char base[MAX_PATH];
+        if (GetWindowsDirectoryA(base, MAX_PATH))
+        {
+            wsprintfA(logpath, "%s\\Temp\\dvhdr-shader.log", base);
+            FILE* probe = fopen(logpath, "a");
+            if (probe) { fclose(probe); mode = 1; }
+        }
+        if (mode == 0)
+        {
+            char tmp[MAX_PATH];
+            DWORD t = GetTempPathA(MAX_PATH, tmp);
+            if (t && t < MAX_PATH) { wsprintfA(logpath, "%sdvhdr-shader.log", tmp); mode = 1; }
+        }
+        char where[MAX_PATH + 48];
+        wsprintfA(where, "dvhdr: shader log -> %s\n", mode ? logpath : "(no writable file; OutputDebugString only)");
+        OutputDebugStringA(where);
+    }
+    if (mode == 1)
+    {
+        FILE* f = fopen(logpath, "a");
+        if (f) { fputs(line, f); fclose(f); }
+    }
+}
+
+// True at most once per gapMs for the given `last` slot - throttles per-frame sites.
+static bool DbgEvery(ULONGLONG& last, DWORD gapMs)
+{
+    ULONGLONG now = GetTickCount64();
+    if (last && now - last < gapMs) return false;
+    last = now;
+    return true;
+}
+
+// True the first time a given (l,t) clip-box origin is seen (records up to 8), so
+// the monitor-match site logs each distinct origin once instead of every frame.
+static int  g_dbgSeen[8][2];
+static int  g_dbgSeenN = 0;
+static bool DbgFirstSeen(int l, int t)
+{
+    if (!g_dbgReady) return true;
+    bool isNew = false;
+    EnterCriticalSection(&g_dbgCs);
+    bool found = false;
+    for (int i = 0; i < g_dbgSeenN; i++)
+        if (g_dbgSeen[i][0] == l && g_dbgSeen[i][1] == t) { found = true; break; }
+    if (!found && g_dbgSeenN < 8) { g_dbgSeen[g_dbgSeenN][0] = l; g_dbgSeen[g_dbgSeenN][1] = t; g_dbgSeenN++; isNew = true; }
+    LeaveCriticalSection(&g_dbgCs);
+    return isNew;
+}
+
+// Log the first several presents of each attach in full detail (reset per attach).
+static volatile LONG g_presentsSinceAttach = 0;
+static bool DbgEarlyPresent() { return g_presentsSinceAttach <= 6; }
+
 static bool aob_match_inverse(const void* buf, const void* mask, int len)
 {
     auto b = (const unsigned char*)buf;
@@ -230,9 +313,12 @@ static MonitorTarget* GetTargetForContext(void* context)
     }
     __except (EXCEPTION_EXECUTE_HANDLER) { return NULL; }
 
+    MonitorTarget* hit = NULL;
     for (auto& t : g_targets)
-        if (t.left == left && t.top == top) return &t;
-    return NULL;
+        if (t.left == left && t.top == top) { hit = &t; break; }
+    if (DbgFirstSeen(left, top))
+        DbgLog("GetTargetForContext: clipbox origin (%d,%d) -> %s", left, top, hit ? "MATCH" : "no-match");
+    return hit;
 }
 
 // ===========================================================================
@@ -831,23 +917,33 @@ static bool ApplyDvhdr_SwapChain(void* ctx, IDXGISwapChain* swap, const RECT* re
 
 static bool ApplyDvhdr_Texture(void* ctx, ID3D11Texture2D* bb, const RECT* rects, int numRects)
 {
+    bool dbg = DbgEarlyPresent();
     try
     {
+        if (dbg) DbgLog("  apply: enter");
         ID3D11Device* dev = NULL;
         bb->GetDevice(&dev);
         if (!dev) return false;
-        if (dev != g_device) { TeardownDevice(); InitDeviceFromDevice(dev); }
+        if (dev != g_device)
+        {
+            if (dbg) DbgLog("  apply: device changed (g_device=%p new=%p) -> teardown+init", (void*)g_device, (void*)dev);
+            TeardownDevice();
+            InitDeviceFromDevice(dev);
+        }
         dev->Release();
 
         D3D11_TEXTURE2D_DESC desc; bb->GetDesc(&desc);
-        if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) return false;
+        if (desc.Format != DXGI_FORMAT_R16G16B16A16_FLOAT) { if (dbg) DbgLog("  apply: non-fp16 fmt=%d, skip", (int)desc.Format); return false; }
         MonitorTarget* tgt = GetTargetForContext(ctx);
         if (!tgt) return false;
-        if (!EnsurePipeline()) return false;
-
-        return RunPipeline(bb, rects, numRects, tgt);
+        if (dbg) DbgLog("  apply: EnsurePipeline...");
+        if (!EnsurePipeline()) { if (dbg) DbgLog("  apply: EnsurePipeline FAILED"); return false; }
+        if (dbg) DbgLog("  apply: RunPipeline (%dx%d)...", (int)desc.Width, (int)desc.Height);
+        bool ok = RunPipeline(bb, rects, numRects, tgt);
+        if (dbg) DbgLog("  apply: RunPipeline -> %d", (int)ok);
+        return ok;
     }
-    catch (...) { return false; }
+    catch (...) { if (dbg) DbgLog("  apply: C++ exception caught"); return false; }
 }
 
 // ===========================================================================
@@ -877,35 +973,86 @@ static COverlayContext_OverlaysEnabled_t*                       COverlayContext_
 // Hook bodies
 // ===========================================================================
 
+// ---- attach / detach race guard --------------------------------------------
+// DWM presents from several threads. On unload the shader must not free its hook
+// trampolines or tear down its D3D device/context while a present is still
+// executing inside the hook body (which is what CopyResource + the six passes
+// run on). g_shaderActive is cleared first so newly entered hooks pass straight
+// through to the original; detach then spins until g_hookInFlight drains to zero
+// before touching any shared GPU state. Cleared/reset on every fresh attach.
+static volatile LONG g_hookInFlight = 0;
+static volatile LONG g_shaderActive = 1;   // render + force-composition gate (0 = passthrough)
+static volatile LONG g_shuttingDown = 0;   // set on detach; freezes the gate off during drain
+
+// Resident enable / disable. The loader flips HKLM\SOFTWARE\DVHDR-DWM "Enabled"
+// and the present hook polls it here (throttled). Disabling restores MPO and lets
+// presents pass straight through WITHOUT unloading the shader; enabling forces MPO
+// off and renders again. This replaces the crash-prone unload/re-inject cycle that
+// toggling and game-pausing used to perform - the module now loads exactly once.
+static bool ReadEnabledFromRegistry(bool defOn)
+{
+    HKEY key;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\DVHDR-DWM", 0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return defOn;
+    DWORD val = 0, cb = sizeof(val), type = 0;
+    LONG rc = RegQueryValueExW(key, L"Enabled", NULL, &type, (BYTE*)&val, &cb);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return defOn;
+    return val != 0;
+}
+
+static void MaybeUpdateShaderEnabled()
+{
+    if (g_shuttingDown) return;
+    static ULONGLONG lastCheck = 0;
+    ULONGLONG now = GetTickCount64();
+    if (now - lastCheck < 300) return;     // poll at most ~3x/sec
+    lastCheck = now;
+    bool want = ReadEnabledFromRegistry(true);
+    if (want != (g_shaderActive != 0))
+    {
+        InterlockedExchange(&g_shaderActive, want ? 1 : 0);
+        if (g_pOverlayTestMode) *g_pOverlayTestMode = want ? 5 : 0;
+        DbgLog("toggle(registry): shader %s", want ? "ENABLED (render, MPO off)"
+                                                   : "DISABLED (passthrough, MPO on)");
+    }
+}
+
 static long COverlayContext_Present_hook(void* self, void* overlaySwapChain, unsigned int a3,
                                          rectVec* rects, unsigned int a5, bool a6)
 {
     if (_ReturnAddress() < (void*)COverlayContext_Present_real_orig)
     {
-        bool hwProtected = isWindows11
-            ? *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11)
-            : *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset);
-        if (hwProtected)
+        InterlockedIncrement(&g_hookInFlight);
+        MaybeUpdateShaderEnabled();
+        if (g_shaderActive)
         {
-            UnsetActive(self);
-        }
-        else
-        {
-            IDXGISwapChain* swap;
-            if (isWindows11)
+            bool hwProtected = isWindows11
+                ? *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11)
+                : *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset);
+            if (hwProtected)
             {
-                int sub = *(int*)((unsigned char*)overlaySwapChain - 4);
-                void* real = (unsigned char*)overlaySwapChain - sub - 0x1b0;
-                swap = *(IDXGISwapChain**)((unsigned char*)real + IOverlaySwapChain_IDXGISwapChain_offset_w11);
+                UnsetActive(self);
             }
             else
             {
-                swap = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain + IOverlaySwapChain_IDXGISwapChain_offset);
+                IDXGISwapChain* swap;
+                if (isWindows11)
+                {
+                    int sub = *(int*)((unsigned char*)overlaySwapChain - 4);
+                    void* real = (unsigned char*)overlaySwapChain - sub - 0x1b0;
+                    swap = *(IDXGISwapChain**)((unsigned char*)real + IOverlaySwapChain_IDXGISwapChain_offset_w11);
+                }
+                else
+                {
+                    swap = *(IDXGISwapChain**)((unsigned char*)overlaySwapChain + IOverlaySwapChain_IDXGISwapChain_offset);
+                }
+                int n = (int)(rects->end - rects->start);
+                if (swap && ApplyDvhdr_SwapChain(self, swap, rects->start, n)) SetActive(self);
+                else                                                           UnsetActive(self);
             }
-            int n = (int)(rects->end - rects->start);
-            if (swap && ApplyDvhdr_SwapChain(self, swap, rects->start, n)) SetActive(self);
-            else                                                           UnsetActive(self);
         }
+        InterlockedDecrement(&g_hookInFlight);
     }
     return COverlayContext_Present_orig(self, overlaySwapChain, a3, rects, a5, a6);
 }
@@ -915,34 +1062,53 @@ static long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwap
 {
     if (_ReturnAddress() < (void*)COverlayContext_Present_real_orig_24h2 || isWindows11_24h2 || isWindows11_25h2)
     {
+        InterlockedIncrement(&g_hookInFlight);
+        MaybeUpdateShaderEnabled();
+        if (g_shaderActive)
+        {
         int n = (int)(rects->end - rects->start);
         if (isWindows11_25h2)
         {
             // Skip hardware-protected (DRM) surfaces — reading one into our
             // unprotected scene texture yields black, which the tonemap would
             // then paint over the panel. Matches the legacy/24H2 guard above.
-            bool hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_25h2);
-            if (hwProtected)
+            static ULONGLONG dbg25 = 0;
+            InterlockedIncrement(&g_presentsSinceAttach);
+            bool dbg = DbgEarlyPresent() || DbgEvery(dbg25, 2000);
+            if (dbg) DbgLog("present(25H2): enter rects=%d - GetBackBuffer_25H2...", n);
+            // Read protection from the back buffer's own D3D11 desc instead of the
+            // fragile struct offset (0x4C misreads true on this dwmcore build).
+            int rawHw = (int)*((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_25h2);
+            ID3D11Texture2D* bb = GetBackBuffer_25H2(overlaySwapChain);
+            if (bb)
             {
-                UnsetActive(self);
-            }
-            else
-            {
-                ID3D11Texture2D* bb = GetBackBuffer_25H2(overlaySwapChain);
-                if (bb)
-                {
-                    if (ApplyDvhdr_Texture(self, bb, rects->start, n)) SetActive(self);
-                    else                                               UnsetActive(self);
-                    bb->Release();
-                }
-                else
+                D3D11_TEXTURE2D_DESC d; bb->GetDesc(&d);
+                bool prot = (d.MiscFlags & D3D11_RESOURCE_MISC_HW_PROTECTED) != 0;
+                if (dbg) DbgLog("present(25H2): rects=%d rawHw@0x4C=%d bb=OK fmt=%d misc=0x%X protected=%d",
+                                n, rawHw, (int)d.Format, (unsigned)d.MiscFlags, (int)prot);
+                if (prot)
                 {
                     UnsetActive(self);
                 }
+                else
+                {
+                    bool applied = ApplyDvhdr_Texture(self, bb, rects->start, n);
+                    if (dbg) DbgLog("present(25H2): ApplyDvhdr_Texture -> %d", (int)applied);
+                    if (applied) SetActive(self);
+                    else         UnsetActive(self);
+                }
+                bb->Release();
+            }
+            else
+            {
+                if (dbg) DbgLog("present(25H2): rects=%d rawHw@0x4C=%d bb=NULL", n, rawHw);
+                UnsetActive(self);
             }
         }
         else // 24H2
         {
+            static ULONGLONG dbg24 = 0;
+            if (DbgEvery(dbg24, 2000)) DbgLog("present(24H2) hook fired: rects=%d", n);
             bool hwProtected = *((bool*)overlaySwapChain + IOverlaySwapChain_HardwareProtected_offset_w11_24h2);
             if (hwProtected)
             {
@@ -956,6 +1122,8 @@ static long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwap
                 else                                                           UnsetActive(self);
             }
         }
+        }
+        InterlockedDecrement(&g_hookInFlight);
     }
     return COverlayContext_Present_orig_24h2(self, overlaySwapChain, a3, rects, a5, a6, a7);
 }
@@ -966,20 +1134,20 @@ static long long COverlayContext_Present_hook_24h2(void* self, void* overlaySwap
 static bool COverlayContext_IsCandidateDirectFlipCompatbile_hook(void* self, void* a2, void* a3, void* a4,
                                                                  int a5, unsigned int a6, bool a7, bool a8)
 {
-    if (GetTargetForContext(self)) return false;
+    if (g_shaderActive && GetTargetForContext(self)) return false;
     return COverlayContext_IsCandidateDirectFlipCompatbile_orig(self, a2, a3, a4, a5, a6, a7, a8);
 }
 
 static bool COverlayContext_IsCandidateDirectFlipCompatbile_hook_24h2(void* self, void* a2, void* a3, void* a4,
                                                                       unsigned int a5, bool a6)
 {
-    if (GetTargetForContext(self)) return false;
+    if (g_shaderActive && GetTargetForContext(self)) return false;
     return COverlayContext_IsCandidateDirectFlipCompatbile_orig_24h2(self, a2, a3, a4, a5, a6);
 }
 
 static bool COverlayContext_OverlaysEnabled_hook(void* self)
 {
-    if (GetTargetForContext(self)) return false;
+    if (g_shaderActive && GetTargetForContext(self)) return false;
     return COverlayContext_OverlaysEnabled_orig(self);
 }
 
@@ -1145,7 +1313,9 @@ static bool ScanAndHook(HMODULE dwmcore, const MODULEINFO& mi)
     MH_CreateHook((PVOID)COverlayContext_OverlaysEnabled_orig,
                   (PVOID)COverlayContext_OverlaysEnabled_hook,
                   (PVOID*)&COverlayContext_OverlaysEnabled_orig);
+    DbgLog("scan: enabling %s hooks", (isWindows11_24h2 || isWindows11_25h2) ? "24h2/25h2" : "legacy");
     MH_EnableHook(MH_ALL_HOOKS);
+    DbgLog("scan: hooks enabled");
     return true;
 }
 
@@ -1159,8 +1329,14 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*reserved*/)
     {
     case DLL_PROCESS_ATTACH:
     {
+        InitializeCriticalSection(&g_dbgCs); g_dbgReady = true;
+        g_shuttingDown = 0;
+        g_hookInFlight = 0;
+        g_presentsSinceAttach = 0;
+        InterlockedExchange(&g_shaderActive, ReadEnabledFromRegistry(true) ? 1 : 0);
+
         HMODULE dwmcore = GetModuleHandleW(L"dwmcore.dll");
-        if (!dwmcore) return FALSE;
+        if (!dwmcore) { DbgLog("attach: dwmcore.dll not present - aborting"); return FALSE; }
 
         MODULEINFO mi = {};
         if (!GetModuleInformation(GetCurrentProcess(), dwmcore, &mi, sizeof(mi))) return FALSE;
@@ -1179,19 +1355,55 @@ BOOL APIENTRY DllMain(HMODULE /*hModule*/, DWORD reason, LPVOID /*reserved*/)
         LoadKnobsFromIni();
         ResolvePerMonitorCaps();
 
-        if (!ScanAndHook(dwmcore, mi)) return FALSE;
+        DbgLog("attach: version=%s (25h2=%d 24h2=%d w11=%d), dwmcore@%p size=0x%X, targets=%d, Overlay=%d",
+               isWindows11_25h2 ? "25H2" : isWindows11_24h2 ? "24H2" : isWindows11 ? "W11" : "W10/none",
+               (int)isWindows11_25h2, (int)isWindows11_24h2, (int)isWindows11,
+               (void*)dwmcore, (unsigned)mi.SizeOfImage, (int)g_targets.size(), g_knobs.DebugOverlay);
+        for (size_t i = 0; i < g_targets.size(); i++)
+            DbgLog("  target[%d]: origin=(%d,%d) index=%d Peak=%.0f MaxFALL=%.0f",
+                   (int)i, g_targets[i].left, g_targets[i].top, g_targets[i].index,
+                   g_targets[i].Peak, g_targets[i].MaxFALL);
+
+        if (!ScanAndHook(dwmcore, mi))
+        {
+            DbgLog("attach: ScanAndHook FAILED - no matching byte patterns in dwmcore for this version path");
+            return FALSE;
+        }
+
+        DbgLog("scan OK: present(24h2/25h2)=%p present(legacy)=%p overlaysEnabled=%p overlayTestMode=%p",
+               (void*)COverlayContext_Present_orig_24h2, (void*)COverlayContext_Present_orig,
+               (void*)COverlayContext_OverlaysEnabled_orig, (void*)g_pOverlayTestMode);
 
         // 25H2: disable DirectFlip/MPO process-wide by flipping the internal
-        // OverlayTestMode flag to 5 (matches the reference's behaviour).
-        if (g_pOverlayTestMode) *g_pOverlayTestMode = 5;
+        // OverlayTestMode flag to 5 - but only if we start enabled; a disabled
+        // start leaves MPO on and passes presents through.
+        if (g_pOverlayTestMode) *g_pOverlayTestMode = g_shaderActive ? 5 : 0;
+        DbgLog("attach: complete, hooks armed - initial state %s%s",
+               g_shaderActive ? "ENABLED" : "DISABLED",
+               (g_pOverlayTestMode && g_shaderActive) ? " (MPO forced off)" : "");
         break;
     }
     case DLL_PROCESS_DETACH:
+    {
+        DbgLog("detach: begin - deactivating, restoring MPO");
+        // Stop routing presents into our body, restore MPO, unpatch dwmcore, then
+        // WAIT for any present still executing inside the hook to finish before
+        // freeing trampolines or the device. Skipping this drain is what let a
+        // present thread read a released context and crash DWM on unload/reload.
+        InterlockedExchange(&g_shuttingDown, 1);   // freeze the registry poll off
+        InterlockedExchange(&g_shaderActive, 0);
         if (g_pOverlayTestMode) { *g_pOverlayTestMode = 0; }
+        MH_DisableHook(MH_ALL_HOOKS);
+        int spins = 0;
+        while (g_hookInFlight > 0 && spins < 2000) { Sleep(1); spins++; }
+        DbgLog("detach: drained in ~%d ms (in-flight remaining=%ld)", spins, g_hookInFlight);
         MH_Uninitialize();
-        Sleep(100);
         TeardownDevice();
+        DbgLog("detach: done");
+        g_dbgReady = false;
+        DeleteCriticalSection(&g_dbgCs);
         break;
+    }
     }
     return TRUE;
 }

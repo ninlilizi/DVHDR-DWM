@@ -8,6 +8,7 @@
 #include <dxgi.h>
 #include <psapi.h>
 #include <cstdio>
+#include <cstdarg>
 #include <intrin.h>
 #include <vector>
 #include <string>

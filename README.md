@@ -68,6 +68,46 @@ resolved at solution-open time:
 `dvhdrloader.exe --unload` removes the DLL and deletes the installed files.
 `dvhdrloader.exe --help` lists all flags.
 
+## Game guard (protects G-Sync)
+
+The DWM shader necessarily disables MPO / DirectFlip so its `Present` hook can
+tonemap every composite - on 25H2 it does so globally, via dwm's internal
+`OverlayTestMode`. That is exactly what strips a borderless or windowed game of
+independent flip, and G-Sync with it. `dvhdrloader.exe --guard` is a persistent,
+elevated watcher that resolves the conflict: while a game holds the foreground it
+**unloads** the shader, returning `dwm.exe` to its clean launch state with MPO
+re-enabled, and **re-injects** once the game exits.
+
+Detection is the same heuristic OLEDSaver uses to protect G-Sync: a geometric
+fullscreen / borderless test plus an ETW present-rate watch for windowed games
+(a process presenting at game cadence that also looks like a game - installed
+under a game store's folder, or carrying both a renderer and a game-input
+library). Both are debounced over two ~2s scans so an alt-tab flash never cycles
+the injection. Knobs live in the `[Guard]` section of `dvhdr.ini`.
+
+Run it **instead of** a plain inject-at-logon task, since it owns the inject /
+unload cycle itself: add one Task Scheduler entry running `dvhdrloader --guard`
+at logon, "run only when logged on" with **highest privileges** (injecting into
+`dwm.exe` needs elevation, and so does the ETW watch). It seeds its state at
+startup (a game already running keeps dwm clean; an idle desktop is injected at
+once) and, while active, re-checks every 15 s so it self-heals across `dwm.exe`
+restarts. `dvhdrloader.exe --guard-stop` stops a running guard: a stop is a full
+shutdown that **unloads** the shader (returning `dwm.exe` to its clean launch
+state with MPO / DirectFlip re-enabled) and removes the installed payload, so
+nothing is left injected without a watcher to manage it.
+
+While running, the guard shows a tray icon whose status dot reads **green** while
+the shader is injected and tonemapping and **red** while it is unloaded - paused
+for a foreground game or manually disabled - so the current state is visible at a
+glance. Hover for the same state as a tooltip.
+
+The right-click menu carries an **Injection enabled** toggle (a left-click on the
+icon flips it too): use it to manually unload the shader on demand and re-inject
+it just as easily. A manual disable is an override that keeps the shader unloaded
+regardless of what game detection sees; re-enabling hands control back to the
+automatic watch. The menu's **Exit guard** item performs the same clean shutdown
+as `--guard-stop` (unload the shader, restore MPO, remove the icon).
+
 ## Idle-screen dimmer (moved out)
 
 The idle-screen dimmer that used to live here as `dvhdrloader --dim` has been
