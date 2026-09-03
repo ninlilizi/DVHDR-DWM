@@ -36,8 +36,21 @@ struct DvhdrCbGpu
     float SdrGamma;
     float SdrSteps;
     UINT  PreserveAlpha;
+
+    UINT  FrameIndex;
+    float SceneCut, Deadband, AblWindowS;
+
+    float FastCeiling;
+    UINT  LiftMetric;
+    float BaseEdgeSigma;
+    UINT  BaseScale;
+
+    float ShadowDesat;
+    UINT  GamutClip;
+    UINT  DitherTemporal;
+    float ContentPeak;
 };
-static_assert(sizeof(DvhdrCbGpu) == 144, "cbuffer layout drift");
+static_assert(sizeof(DvhdrCbGpu) == 192, "cbuffer layout drift");
 
 struct DvhdrKnobs
 {
@@ -62,6 +75,16 @@ struct DvhdrKnobs
     float SdrGamma;               // 0 = auto, -1 = sRGB piecewise, > 0 = power-law exponent
     int   ProcessSDR;             // 0 = pass SDR chains through untouched
     int   LogEnabled;             // [Debug] Log
+    float SceneCut;               // PQ jump that counts as a scene cut
+    float Deadband;               // fraction
+    float AblWindowS;             // seconds
+    float FastCeiling;            // factor over the FALL target
+    int   LiftMetric;             // 0 linear FALL / 1 perceptual mean
+    float BaseEdgeSigma;          // PQ
+    int   BaseDownscale;          // base resolution divisor
+    float ShadowDesat;            // nits
+    int   GamutClip;
+    int   DitherTemporal;
 };
 
 extern DvhdrKnobs g_knobs;
@@ -73,6 +96,7 @@ struct SurfaceInfo
     float SdrWhiteNits;   // CSP_SDR only: luminance of code 1.0
     float SdrGamma;       // CSP_SDR only: 0 = sRGB piecewise, else the exponent
     float SdrSteps;       // CSP_SDR only: code steps of the back buffer
+    float ContentPeak;    // declared HDR content peak (nits) from SetHDRMetaData; 0 = none
 };
 
 // Records the module handle of this proxy DLL so config can be read from the
@@ -94,4 +118,4 @@ bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* ou
 void Config_DescribeSurface(const SurfaceInfo& surf, char* buf, size_t n);
 
 // Fill a cbuffer snapshot from the current knobs + surface + measured frame time + size.
-void Config_FillCbuffer(DvhdrCbGpu* out, UINT w, UINT h, const SurfaceInfo& surf, float frameTimeMs);
+void Config_FillCbuffer(DvhdrCbGpu* out, UINT w, UINT h, const SurfaceInfo& surf, float frameTimeMs, UINT frameIndex);

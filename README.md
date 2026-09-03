@@ -7,9 +7,11 @@ the panel's true MaxFALL and rolled off below its safe luminance ceiling.
 Three binaries:
 
 - **`dvhdr.dll`** — injected payload. Lives inside `dwm.exe`. Hooks
-  `COverlayContext::Present` and runs a six-pass shader (histogram + temporal
-  adapt + separable luminance blur + BT.2390 tonemap with shadow lift + local
-  contrast) over the back-buffer before scanout, only on monitors listed in
+  `COverlayContext::Present` and runs a six-pass shader (histogram +
+  scene-cut-aware temporal adapt with a two-timescale ABL governor +
+  edge-aware luminance base + BT.2390 tonemap with shadow lift, local
+  contrast, ICtCp chroma and a hue-preserving gamut clip) over the
+  back-buffer before scanout, only on monitors listed in
   `dvhdr.targets`. SDR content and non-targeted monitors pass through unmodified.
 - **`dvhdrloader.exe`** — Task-Scheduler-friendly companion. Idempotent: a
   no-args run injects the DLL if absent, no-ops if already present. Run elevated

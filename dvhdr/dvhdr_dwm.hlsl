@@ -87,6 +87,21 @@ cbuffer DVHDRCb : register(b0)
     float  SdrGamma;        // CSP_SDR: 0 = sRGB piecewise, else the power-law exponent (1 = linear, for _SRGB views)
     float  SdrSteps;        // CSP_SDR: code steps in the back buffer (255 / 1023)
     uint   PreserveAlpha;   // 1 = carry the source alpha through (proxy); 0 = write opaque (DWM)
+
+    uint   FrameIndex;      // frame counter, walks the temporal dither
+    float  SceneCut;        // PQ jump of the frame average that counts as a cut; 0 = never snap
+    float  Deadband;        // fraction of change the adapt smoothing ignores
+    float  AblWindowS;      // seconds: slow energy integrator that drives compression; 0 = fast average drives it
+
+    float  FastCeiling;     // factor over the FALL target past which the fast average compresses at once
+    uint   LiftMetric;      // 0 = linear frame average, 1 = perceptual (PQ) mean
+    float  BaseEdgeSigma;   // PQ range sigma of the edge-aware base; 0 = plain Gaussian
+    uint   BaseScale;       // base/blur resolution divisor (0 or 1 = full)
+
+    float  ShadowDesat;     // nits below which chroma preservation fades out; 0 = off
+    uint   GamutClip;       // 1 = hue-preserving clip toward the luminance axis
+    uint   DitherTemporal;  // 1 = frame-varying dither pattern
+    float  ContentPeak;     // declared content peak (HDR metadata) that seeds adaptation; 0 = none
 };
 
 // ===========================================================================
@@ -187,6 +202,25 @@ float luminance(float3 n, uint csp)
     return dot(max(n, 0.0), float3(0.2126, 0.7152, 0.0722));
 }
 
+// Hue-preserving gamut clip: a colour with a channel below zero or above the
+// ceiling is pulled straight toward its own luminance until it fits, instead
+// of having the offending channel chopped, which shifts the hue.
+float3 gamut_clip(float3 c, float ceiling, uint csp)
+{
+    float3 w  = (csp == CSP_HDR10) ? float3(0.2627, 0.6780, 0.0593) : float3(0.2126, 0.7152, 0.0722);
+    float  Y  = max(dot(c, w), 0.0);
+    float  mn = min(c.r, min(c.g, c.b));
+    if (mn < 0.0)
+        c = Y + (c - Y) * (Y / max(Y - mn, 1e-6));
+    float  mx = max(c.r, max(c.g, c.b));
+    if (ceiling > 0.0 && mx > ceiling)
+    {
+        float Yc = min(Y, ceiling);
+        c = Yc + (c - Yc) * saturate((ceiling - Yc) / max(mx - Yc, 1e-6));
+    }
+    return max(c, 0.0);
+}
+
 float bt2390_eetf(float L, float srcPeak, float dstPeak, float dstBlack)
 {
     srcPeak = max(srcPeak, dstPeak);
@@ -275,7 +309,10 @@ float3 dice_recombine(float3 linNits, float Ysrc, float Yt, uint csp, float chro
     float Isrc      = ictcp.x;
     float pqDelta   = nits_to_pq(Yt) - nits_to_pq(max(Ysrc, 1e-4));
     float Idst      = saturate(Isrc + pqDelta);
-    float chromaScl = lerp(1.0, Idst / max(Isrc, 1e-4), chromaCorrect);
+    // Lifted near-black would have its (mostly noise) chroma multiplied hard;
+    // fade the preservation out below ShadowDesat so it lightens to grey.
+    float shadowW   = (ShadowDesat > 0.0) ? smoothstep(0.0, nits_to_pq(ShadowDesat), nits_to_pq(Yt)) : 1.0;
+    float chromaScl = lerp(1.0, Idst / max(Isrc, 1e-4), chromaCorrect * shadowW);
 
     ictcp.x   = Idst;
     ictcp.yz *= chromaScl;
@@ -284,7 +321,7 @@ float3 dice_recombine(float3 linNits, float Ysrc, float Yt, uint csp, float chro
     float3 lms2    = PQ_to_linear(saturate(lmsp2)) * 10000.0;
     float3 out2020 = mul(LMS_to_RGB2020, lms2);
     float3 outNits = (csp == CSP_HDR10) ? out2020 : mul(RGB2020_to_709, out2020);
-    return max(outNits, 0.0);
+    return (GamutClip != 0u) ? gamut_clip(outNits, output_ceiling(), csp) : max(outNits, 0.0);
 }
 
 // ===========================================================================
@@ -366,8 +403,14 @@ void CS_Analyze(uint3 id : SV_DispatchThreadID)
 [numthreads(1, 1, 1)]
 void CS_Adapt(uint3 id : SV_DispatchThreadID)
 {
+    // Two averages come out of the histogram: the linear frame average (FALL,
+    // what the panel's ABL answers to) and the perceptual (PQ) mean (what a
+    // viewer reads as the scene's brightness). Texel 0 of the adapt state keeps
+    // the fast-smoothed peak / FALL; texel 1 keeps the slow ABL energy
+    // integrator and the smoothed perceptual mean.
     float total   = 0.0;
     float sumNits = 0.0;
+    float sumPq   = 0.0;
     float maxBin  = 1.0;
 
     [loop]
@@ -376,10 +419,12 @@ void CS_Adapt(uint3 id : SV_DispatchThreadID)
         float cnt = float(HistogramUAV[int2(i, 0)]);
         total   += cnt;
         sumNits += cnt * bin_to_nits(i);
+        sumPq   += cnt * ((i + 0.5) / float(DVHDR_BINS));
         maxBin   = max(maxBin, cnt);
     }
 
-    float fall = sumNits / max(total, 1.0);
+    float fall     = sumNits / max(total, 1.0);
+    float meanNits = pq_to_nits(sumPq / max(total, 1.0));
 
     float allow = total * (1.0 - PeakPercentile * 0.01);
     float acc   = 0.0;
@@ -393,18 +438,43 @@ void CS_Adapt(uint3 id : SV_DispatchThreadID)
     float peak = bin_to_nits(pidx);
 
     float4 prev  = AdaptUAV[int2(0, 0)];
+    float4 prev2 = AdaptUAV[int2(1, 0)];
     float  pPeak = prev.x;
     float  pFall = prev.y;
-    if (pFall <= 0.0001) pFall = fall;
-    if (pPeak <= 0.0001) pPeak = peak;
+    float  pSlow = prev2.x;
+    float  pMean = prev2.y;
+
+    // First frame: start from what is on screen, or from the declared content peak.
+    if (pFall <= 0.0001) { pFall = fall; pSlow = fall; pMean = meanNits; }
+    if (pPeak <= 0.0001) pPeak = (ContentPeak > 0.0) ? ContentPeak : peak;
+    if (pSlow <= 0.0001) pSlow = fall;
+    if (pMean <= 0.0001) pMean = meanNits;
+
+    // A jump of the frame average beyond SceneCut (in PQ) is a cut, not a
+    // drift: the fast state snaps to the new scene instead of easing into it.
+    float jump = abs(nits_to_pq(fall) - nits_to_pq(pFall));
+    bool  cut  = (SceneCut > 0.0) && (jump > SceneCut);
+
+    // Changes within the deadband hold the previous value, so a scene hovering
+    // around the target does not breathe.
+    float tFall = (abs(fall - pFall)     <= Deadband * pFall) ? pFall : fall;
+    float tPeak = (abs(peak - pPeak)     <= Deadband * pPeak) ? pPeak : peak;
+    float tMean = (abs(meanNits - pMean) <= Deadband * pMean) ? pMean : meanNits;
 
     float aUp = saturate(1.0 - exp(-FrameTimeMs / max(AttackMs,  1.0)));
     float aDn = saturate(1.0 - exp(-FrameTimeMs / max(ReleaseMs, 1.0)));
 
-    float sFall = lerp(pFall, fall, (fall > pFall) ? aUp : aDn);
-    float sPeak = lerp(pPeak, peak, (peak > pPeak) ? aUp : aDn);
+    float sFall = cut ? fall     : lerp(pFall, tFall, (tFall > pFall) ? aUp : aDn);
+    float sPeak = cut ? peak     : lerp(pPeak, tPeak, (tPeak > pPeak) ? aUp : aDn);
+    float sMean = cut ? meanNits : lerp(pMean, tMean, (tMean > pMean) ? aUp : aDn);
+
+    // Sustained energy for ABL: a slow integrator that a cut does not reset,
+    // because the panel's power budget does not reset either.
+    float aSlow    = (AblWindowS > 0.0) ? saturate(1.0 - exp(-FrameTimeMs / (AblWindowS * 1000.0))) : 1.0;
+    float slowFall = lerp(pSlow, fall, aSlow);
 
     AdaptUAV[int2(0, 0)] = float4(sPeak, sFall, fall, maxBin);
+    AdaptUAV[int2(1, 0)] = float4(slowFall, sMean, meanNits, 0.0);
 }
 
 // ===========================================================================
@@ -435,21 +505,54 @@ float pq_luma_at(int2 px)
     return nits_to_pq(luminance(decode_to_nits(c, ColorSpace), ColorSpace));
 }
 
+// The blur runs at the base resolution (BufferSize / BaseScale): the base is
+// low frequency by definition, so a downscaled one costs a fraction and reads
+// back through the linear sampler with no visible loss. With BaseEdgeSigma the
+// blur is bilateral: neighbours far from the centre in PQ weigh little, so the
+// base follows edges instead of bleeding across them, and the lift stops
+// haloing around bright objects.
+
+uint base_scale() { return max(BaseScale, 1u); }
+
+int2 base_size()
+{
+    uint s = base_scale();
+    return int2((BufferSize + (s - 1u)) / s);
+}
+
+// Full-resolution pixel at the centre of a base-resolution one.
+int2 base_to_full(int2 bp)
+{
+    int s = int(base_scale());
+    return min(bp * s + (s >> 1), int2(BufferSize) - 1);
+}
+
+float range_weight(float v, float c)
+{
+    if (BaseEdgeSigma <= 0.0) return 1.0;
+    float d = (v - c) / BaseEdgeSigma;
+    return exp(-0.5 * d * d);
+}
+
 float PS_BlurH(VS_OUT input) : SV_TARGET
 {
-    int2 px = int2(input.pos.xy);
+    int2 bp = int2(input.pos.xy);
+    int2 fp = base_to_full(bp);
     if (DetailGain <= 0.0)
-        return pq_luma_at(px);
+        return pq_luma_at(fp);
 
-    int   R     = clamp(int(DetailRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+    int   s     = int(base_scale());
+    int   R     = clamp(int(DetailRadius / float(s) + 0.5), 1, DVHDR_LC_MAX_RADIUS);
     float sigma = max(R * 0.5, 1.0);
+    float c     = pq_luma_at(fp);
     float sum = 0.0, wsum = 0.0;
     [loop]
     for (int d = -R; d <= R; d++)
     {
-        int2  sp  = int2(clamp(px.x + d, 0, int(BufferSize.x) - 1), px.y);
-        float wgt = exp(-0.5 * float(d * d) / (sigma * sigma));
-        sum  += pq_luma_at(sp) * wgt;
+        int   x   = clamp(fp.x + d * s, 0, int(BufferSize.x) - 1);
+        float v   = pq_luma_at(int2(x, fp.y));
+        float wgt = exp(-0.5 * float(d * d) / (sigma * sigma)) * range_weight(v, c);
+        sum  += v * wgt;
         wsum += wgt;
     }
     return sum / max(wsum, 1e-5);
@@ -457,19 +560,25 @@ float PS_BlurH(VS_OUT input) : SV_TARGET
 
 float PS_BlurV(VS_OUT input) : SV_TARGET
 {
-    int2 px = int2(input.pos.xy);
+    int2 bp = int2(input.pos.xy);
     if (DetailGain <= 0.0)
-        return LumaHSRV.Load(int3(px, 0));
+        return LumaHSRV.Load(int3(bp, 0));
 
-    int   R     = clamp(int(DetailRadius + 0.5), 1, DVHDR_LC_MAX_RADIUS);
+    int   s     = int(base_scale());
+    int   R     = clamp(int(DetailRadius / float(s) + 0.5), 1, DVHDR_LC_MAX_RADIUS);
     float sigma = max(R * 0.5, 1.0);
+    int   maxY  = base_size().y - 1;
+    // The range term compares against the pixel's own luma, not the
+    // horizontally blurred one, so an edge survives both passes.
+    float c     = pq_luma_at(base_to_full(bp));
     float sum = 0.0, wsum = 0.0;
     [loop]
     for (int d = -R; d <= R; d++)
     {
-        int2  sp  = int2(px.x, clamp(px.y + d, 0, int(BufferSize.y) - 1));
-        float wgt = exp(-0.5 * float(d * d) / (sigma * sigma));
-        sum  += LumaHSRV.Load(int3(sp, 0)) * wgt;
+        int   y   = clamp(bp.y + d, 0, maxY);
+        float v   = LumaHSRV.Load(int3(bp.x, y, 0));
+        float wgt = exp(-0.5 * float(d * d) / (sigma * sigma)) * range_weight(v, c);
+        sum  += v * wgt;
         wsum += wgt;
     }
     return sum / max(wsum, 1e-5);
@@ -489,15 +598,28 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
         ? deband_source(uv, input.pos.xy, float2(1.0 / BufferSize.x, 1.0 / BufferSize.y))
         : srcPx.rgb;
     float  outA  = (PreserveAlpha != 0u) ? srcPx.a : 1.0;
-    float4 ad    = AdaptSRV.Load(int3(0, 0, 0));
-    float  adPeak = ad.x;
-    float  adFall = ad.y;
+    float4 ad       = AdaptSRV.Load(int3(0, 0, 0));
+    float4 ad2      = AdaptSRV.Load(int3(1, 0, 0));
+    float  adPeak   = ad.x;
+    float  adFall   = ad.y;
+    float  slowFall = ad2.x;
+    float  adMean   = ad2.y;
 
     float ceiling    = output_ceiling();
     float targetFall = min(DisplayMaxFALL, ceiling) * (HeadroomPercent * 0.01);
-    float ratio      = targetFall / max(adFall, 0.01);
-    float g = (ratio < 1.0) ? max(ratio, MinGain)
-                            : min(pow(max(ratio, 1.0), LiftStrength), MaxGain);
+
+    // Compression guards the panel's power budget, which follows sustained
+    // linear energy: the slow integrator drives it and the fast average only
+    // steps in above the ceiling. The lift answers to how bright the scene
+    // reads, the perceptual mean when so configured.
+    float compFall = (AblWindowS > 0.0)
+        ? max(slowFall, (adFall > targetFall * max(FastCeiling, 1.0)) ? adFall : 0.0)
+        : adFall;
+    float liftRef  = (LiftMetric != 0u) ? adMean : adFall;
+    float ratioC   = targetFall / max(compFall, 0.01);
+    float ratioL   = targetFall / max(liftRef, 0.01);
+    float g = (ratioC < 1.0) ? max(ratioC, MinGain)
+                             : min(pow(max(ratioL, 1.0), LiftStrength), MaxGain);
 
     float3 lin  = decode_to_nits(src, ColorSpace);
     float  Ysrc = luminance(lin, ColorSpace);
@@ -592,9 +714,12 @@ float4 PS_Tonemap(VS_OUT input) : SV_TARGET
         float  actF = lerp(DitherFloor, 1.0, saturate(act / max(DitherActivity, 1e-5)));
         float  lsb  = DitherStrength * perc_step() * actF;   // one output code step, scaled
 
-        float3 noise = float3(ign(input.pos.xy),
-                              ign(input.pos.xy + float2(53.0, 17.0)),
-                              ign(input.pos.xy + float2(101.0, 71.0))) - 0.5;
+        // A frame-varying offset walks the pattern so it averages out over
+        // time instead of sitting still on the panel.
+        float2 dpos  = input.pos.xy + ((DitherTemporal != 0u) ? float(FrameIndex % 64u) * 5.588238 : 0.0);
+        float3 noise = float3(ign(dpos),
+                              ign(dpos + float2(53.0, 17.0)),
+                              ign(dpos + float2(101.0, 71.0))) - 0.5;
 
         if (ColorSpace != CSP_SCRGB)
         {

@@ -1,7 +1,7 @@
 // hook.cpp — installs the Present interception. dxgi swap chains (whether the
 // game drives them through D3D11 or D3D12) share one vtable implemented in
 // dxgi.dll, so a single throwaway D3D11 swap chain yields the code addresses of
-// Present / Present1 / ResizeBuffers / SetColorSpace1, and MinHook then catches
+// Present / Present1 / ResizeBuffers / SetColorSpace1 / SetHDRMetaData, and MinHook then catches
 // every swap chain in the process. A throwaway D3D12 queue gives
 // ExecuteCommandLists, which we hook only to learn which DIRECT queue the game
 // presents through (D3D12 has no way to recover the queue from the swap chain).
@@ -20,12 +20,14 @@ typedef HRESULT (STDMETHODCALLTYPE* Present_t)(IDXGISwapChain*, UINT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE* Present1_t)(IDXGISwapChain1*, UINT, UINT, const DXGI_PRESENT_PARAMETERS*);
 typedef HRESULT (STDMETHODCALLTYPE* ResizeBuffers_t)(IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT);
 typedef HRESULT (STDMETHODCALLTYPE* SetColorSpace1_t)(IDXGISwapChain3*, DXGI_COLOR_SPACE_TYPE);
+typedef HRESULT (STDMETHODCALLTYPE* SetHDRMetaData_t)(IDXGISwapChain4*, DXGI_HDR_METADATA_TYPE, UINT, void*);
 typedef void    (STDMETHODCALLTYPE* ExecuteCommandLists_t)(ID3D12CommandQueue*, UINT, ID3D12CommandList* const*);
 
 static Present_t             g_presentOrig             = NULL;
 static Present1_t            g_present1Orig            = NULL;
 static ResizeBuffers_t       g_resizeOrig              = NULL;
 static SetColorSpace1_t      g_setColorSpaceOrig       = NULL;
+static SetHDRMetaData_t      g_setHdrMetaOrig          = NULL;
 static ExecuteCommandLists_t g_execOrig                = NULL;
 
 // Present and ResizeBuffers arrive from whichever threads the application
@@ -104,6 +106,20 @@ static HRESULT STDMETHODCALLTYPE SetColorSpace1_hook(IDXGISwapChain3* sc, DXGI_C
     return hr;
 }
 
+// Mastering metadata names the content's own peak; it seeds the adaptation
+// before the histogram has had a frame to measure it.
+static HRESULT STDMETHODCALLTYPE SetHDRMetaData_hook(IDXGISwapChain4* sc, DXGI_HDR_METADATA_TYPE type,
+                                                    UINT size, void* data)
+{
+    HRESULT hr = g_setHdrMetaOrig(sc, type, size, data);
+    if (SUCCEEDED(hr)) Display_RecordHdrMetadata(sc, type, size, data);
+    float peak = 0.0f, fall = 0.0f;
+    bool have = Display_GetRecordedHdrMetadata(sc, &peak, &fall);
+    Log_Write("chain %p: SetHDRMetaData(type %d, %u bytes) hr=0x%08x -> peak %.0f fall %.0f nits",
+              sc, (int)type, size, (unsigned)hr, have ? peak : 0.0f, have ? fall : 0.0f);
+    return hr;
+}
+
 static void STDMETHODCALLTYPE ExecuteCommandLists_hook(ID3D12CommandQueue* q, UINT n,
                                                       ID3D12CommandList* const* lists)
 {
@@ -173,9 +189,11 @@ static IDXGISwapChain* MakeThrowawayChain(ID3D11Device* dev, HWND* outWnd)
     return sc;
 }
 
-// Read Present (8), ResizeBuffers (13), Present1 (22) and SetColorSpace1 (38, via
-// IDXGISwapChain3) from a throwaway swap chain's vtable.
-static bool GrabSwapChainMethods(void** outPresent, void** outResize, void** outPresent1, void** outSetColorSpace)
+// Read Present (8), ResizeBuffers (13), Present1 (22), SetColorSpace1 (38, via
+// IDXGISwapChain3) and SetHDRMetaData (40, via IDXGISwapChain4) from a throwaway
+// swap chain's vtable.
+static bool GrabSwapChainMethods(void** outPresent, void** outResize, void** outPresent1,
+                                 void** outSetColorSpace, void** outSetHdrMeta)
 {
     D3D_FEATURE_LEVEL fl = D3D_FEATURE_LEVEL_11_0;
     ID3D11Device*        dev = NULL;
@@ -205,6 +223,14 @@ static bool GrabSwapChainMethods(void** outPresent, void** outResize, void** out
     {
         *outSetColorSpace = (*(void***)sc3)[38];
         sc3->Release();
+    }
+
+    *outSetHdrMeta = NULL;
+    IDXGISwapChain4* sc4 = NULL;
+    if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc4))) && sc4)
+    {
+        *outSetHdrMeta = (*(void***)sc4)[40];
+        sc4->Release();
     }
 
     sc->Release();
@@ -251,8 +277,8 @@ static DWORD WINAPI InstallThread(LPVOID)
         Log_Write("helper process, hooks not installed");
         return 0;
     }
-    void *present = NULL, *resize = NULL, *present1 = NULL, *setCsp = NULL, *exec = NULL;
-    if (!GrabSwapChainMethods(&present, &resize, &present1, &setCsp))
+    void *present = NULL, *resize = NULL, *present1 = NULL, *setCsp = NULL, *setMeta = NULL, *exec = NULL;
+    if (!GrabSwapChainMethods(&present, &resize, &present1, &setCsp, &setMeta))
     {
         Log_Write("could not create a throwaway swap chain, hooks not installed");
         return 0;
@@ -265,11 +291,12 @@ static DWORD WINAPI InstallThread(LPVOID)
     MH_CreateHook(resize,   (LPVOID)ResizeBuffers_hook, (LPVOID*)&g_resizeOrig);
     if (present1) MH_CreateHook(present1, (LPVOID)Present1_hook, (LPVOID*)&g_present1Orig);
     if (setCsp)   MH_CreateHook(setCsp,   (LPVOID)SetColorSpace1_hook, (LPVOID*)&g_setColorSpaceOrig);
+    if (setMeta)  MH_CreateHook(setMeta,  (LPVOID)SetHDRMetaData_hook, (LPVOID*)&g_setHdrMetaOrig);
     if (exec)     MH_CreateHook(exec,    (LPVOID)ExecuteCommandLists_hook, (LPVOID*)&g_execOrig);
 
     MH_EnableHook(MH_ALL_HOOKS);
-    Log_Write("hooks installed: Present=%p Present1=%p ResizeBuffers=%p SetColorSpace1=%p ExecuteCommandLists=%p",
-              present, present1, resize, setCsp, exec);
+    Log_Write("hooks installed: Present=%p Present1=%p ResizeBuffers=%p SetColorSpace1=%p SetHDRMetaData=%p ExecuteCommandLists=%p",
+              present, present1, resize, setCsp, setMeta, exec);
     return 0;
 }
 

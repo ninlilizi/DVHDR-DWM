@@ -77,6 +77,8 @@ struct Fx11
 
     LARGE_INTEGER qpcFreq = {};
     LARGE_INTEGER qpcLast = {};
+    UINT frameIndex = 0;
+    UINT baseW = 0, baseH = 0;        // resolution of the lift base (blur) textures
     bool pipelineReady = false;
 };
 
@@ -216,15 +218,15 @@ static bool CreateDeviceResources(Fx11& s)
     }
     {
         D3D11_TEXTURE2D_DESC d = {};
-        d.Width = 1; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;
+        d.Width = 2; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;   // two texels of adapt state
         d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
         if (FAILED(s.device->CreateTexture2D(&d, NULL, &s.adaptTex))) return false;
         if (FAILED(s.device->CreateShaderResourceView(s.adaptTex, NULL, &s.adaptSRV))) return false;
         if (FAILED(s.device->CreateUnorderedAccessView(s.adaptTex, NULL, &s.adaptUAV))) return false;
-        float zero[4] = {0,0,0,0};
-        D3D11_BOX box = { 0,0,0, 1,1,1 };
+        float zero[8] = {0,0,0,0,0,0,0,0};
+        D3D11_BOX box = { 0,0,0, 2,1,1 };
         s.context->UpdateSubresource(s.adaptTex, 0, &box, zero, sizeof(zero), sizeof(zero));
     }
     {
@@ -270,9 +272,13 @@ static bool EnsureSizeBound(Fx11& s, UINT W, UINT H, DXGI_FORMAT fmt)
         if (FAILED(s.device->CreateTexture2D(&d, NULL, &s.sceneTex))) return false;
         if (FAILED(s.device->CreateShaderResourceView(s.sceneTex, NULL, &s.sceneSRV))) return false;
     }
+    // The base is low frequency; its textures live at a fraction of the size.
+    UINT scale = (g_knobs.BaseDownscale >= 1) ? (UINT)g_knobs.BaseDownscale : 1u;
+    s.baseW = (W + scale - 1) / scale;
+    s.baseH = (H + scale - 1) / scale;
     {
         D3D11_TEXTURE2D_DESC d = {};
-        d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
+        d.Width = s.baseW; d.Height = s.baseH; d.MipLevels = 1; d.ArraySize = 1;
         d.Format = DXGI_FORMAT_R16_FLOAT; d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
         d.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -295,7 +301,7 @@ static void UpdateCbuffer(Fx11& s, UINT W, UINT H, const SurfaceInfo& surf)
     if (dt > 1000.0 || dt <= 0.0) dt = 16.6;
 
     DvhdrCbGpu cb = {};
-    Config_FillCbuffer(&cb, W, H, surf, (float)dt);
+    Config_FillCbuffer(&cb, W, H, surf, (float)dt, s.frameIndex++);
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(s.context->Map(s.cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -469,8 +475,9 @@ static bool RunPipeline(Fx11& s, ID3D11Texture2D* backBuffer, const SurfaceInfo&
     ID3D11ShaderResourceView* nullCsSrv[1] = { NULL };
     c->CSSetShaderResources(0, 1, nullCsSrv);
 
-    D3D11_VIEWPORT vp = { 0.f, 0.f, (float)bbd.Width, (float)bbd.Height, 0.f, 1.f };
-    c->RSSetViewports(1, &vp);
+    D3D11_VIEWPORT vp     = { 0.f, 0.f, (float)bbd.Width, (float)bbd.Height, 0.f, 1.f };
+    D3D11_VIEWPORT vpBase = { 0.f, 0.f, (float)s.baseW, (float)s.baseH, 0.f, 1.f };
+    c->RSSetViewports(1, &vpBase);          // the blur passes run at the base resolution
     c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     c->IASetInputLayout(NULL);
     c->VSSetShader(s.vsPost, NULL, 0);
@@ -487,8 +494,9 @@ static bool RunPipeline(Fx11& s, ID3D11Texture2D* backBuffer, const SurfaceInfo&
     // inheriting whatever scissor the game left bound at Present (which could clip
     // the blur and leave the base black, killing the lift at LiftLocality 0).
     c->RSSetState(s.rasterScissor);
-    D3D11_RECT full = { 0, 0, (LONG)bbd.Width, (LONG)bbd.Height };
-    c->RSSetScissorRects(1, &full);
+    D3D11_RECT full     = { 0, 0, (LONG)bbd.Width, (LONG)bbd.Height };
+    D3D11_RECT fullBase = { 0, 0, (LONG)s.baseW, (LONG)s.baseH };
+    c->RSSetScissorRects(1, &fullBase);
 
     ID3D11ShaderResourceView* nullSrvs[5] = { NULL, NULL, NULL, NULL, NULL };
 
@@ -500,6 +508,7 @@ static bool RunPipeline(Fx11& s, ID3D11Texture2D* backBuffer, const SurfaceInfo&
 
     c->OMSetRenderTargets(0, NULL, NULL);
     c->PSSetShaderResources(0, 5, nullSrvs);
+    c->PSSetShaderResources(0, 1, &s.sceneSRV);   // the edge term reads the source luma
     c->PSSetShaderResources(3, 1, &s.lumaHSRV);
     c->OMSetRenderTargets(1, &s.lumaBlurRTV, NULL);
     c->PSSetShader(s.psBlurV, NULL, 0);
@@ -514,6 +523,7 @@ static bool RunPipeline(Fx11& s, ID3D11Texture2D* backBuffer, const SurfaceInfo&
     c->OMSetRenderTargets(1, &bbRTV, NULL);
     c->PSSetShader(s.psTonemap, NULL, 0);
     c->RSSetState(s.rasterScissor);
+    c->RSSetViewports(1, &vp);
     c->RSSetScissorRects(1, &full);
     c->Draw(3, 0);
     bbRTV->Release();

@@ -7,6 +7,11 @@ void Display_RecordColorSpace(IDXGISwapChain* sc, DXGI_COLOR_SPACE_TYPE cs);
 void Display_ClearRecordedColorSpace(IDXGISwapChain* sc);
 bool Display_GetRecordedColorSpace(IDXGISwapChain* sc, DXGI_COLOR_SPACE_TYPE* out);
 
+// Likewise for the HDR10 mastering metadata a game declares through
+// SetHDRMetaData: its content peak and frame-average light levels, in nits.
+void Display_RecordHdrMetadata(IDXGISwapChain* sc, DXGI_HDR_METADATA_TYPE type, UINT size, const void* data);
+bool Display_GetRecordedHdrMetadata(IDXGISwapChain* sc, float* peakNits, float* fallNits);
+
 // False for chains composed with alpha (premultiplied / straight): overlays,
 // which the pass leaves alone.
 bool Display_IsOpaqueChain(IDXGISwapChain* sc);

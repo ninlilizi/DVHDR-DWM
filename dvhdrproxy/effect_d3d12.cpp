@@ -77,6 +77,8 @@ struct Fx12
 
     LARGE_INTEGER qpcFreq = {};
     LARGE_INTEGER qpcLast = {};
+    UINT frameIndex = 0;
+    UINT baseW = 0, baseH = 0;        // resolution of the lift base (blur) textures
 };
 
 static const int kMaxSlots = 4;
@@ -405,7 +407,7 @@ static bool CreateDeviceObjects(Fx12& s, ID3D12Device* dev)
 
     // Persistent analysis state (histogram + temporal adapt), kept in UAV state.
     if (!CreateTex(s, s.hist,  256, 1, DXGI_FORMAT_R32_SINT,          D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return false;
-    if (!CreateTex(s, s.adapt, 1,   1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return false;
+    if (!CreateTex(s, s.adapt, 2,   1, DXGI_FORMAT_R32G32B32A32_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)) return false;
 
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -470,8 +472,12 @@ static bool EnsureSizeBound(Fx12& s, IDXGISwapChain* swap, UINT w, UINT h, DXGI_
     s.scene = Res(); s.lumaH = Res(); s.lumaBlur = Res();
 
     if (!CreateTex(s, s.scene, w, h, fmt, D3D12_RESOURCE_FLAG_NONE, D3D12_RESOURCE_STATE_COPY_DEST)) return false;
-    if (!CreateTex(s, s.lumaH, w, h, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) return false;
-    if (!CreateTex(s, s.lumaBlur, w, h, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) return false;
+    // The base is low frequency; its textures live at a fraction of the size.
+    UINT scale = (g_knobs.BaseDownscale >= 1) ? (UINT)g_knobs.BaseDownscale : 1u;
+    s.baseW = (w + scale - 1) / scale;
+    s.baseH = (h + scale - 1) / scale;
+    if (!CreateTex(s, s.lumaH, s.baseW, s.baseH, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) return false;
+    if (!CreateTex(s, s.lumaBlur, s.baseW, s.baseH, DXGI_FORMAT_R16_FLOAT, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)) return false;
 
     {
         D3D12_SHADER_RESOURCE_VIEW_DESC sd = {};
@@ -510,7 +516,7 @@ static void UpdateCbuffer(Fx12& s, UINT w, UINT h, const SurfaceInfo& surf)
     if (dt > 1000.0 || dt <= 0.0) dt = 16.6;
 
     DvhdrCbGpu cb = {};
-    Config_FillCbuffer(&cb, w, h, surf, (float)dt);
+    Config_FillCbuffer(&cb, w, h, surf, (float)dt, s.frameIndex++);
     memcpy(s.cbMapped, &cb, sizeof(cb));
 }
 
@@ -645,10 +651,12 @@ bool Effect12_Apply(IDXGISwapChain* swap, const DXGI_PRESENT_PARAMETERS* present
     list->SetGraphicsRootDescriptorTable(2, SrvGpu(s, SLOT_HISTUAV));
     list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 
-    D3D12_VIEWPORT vp = { 0.f, 0.f, (float)bd.Width, (float)bd.Height, 0.f, 1.f };
-    D3D12_RECT     rc = { 0, 0, (LONG)bd.Width, (LONG)bd.Height };
-    list->RSSetViewports(1, &vp);
-    list->RSSetScissorRects(1, &rc);
+    D3D12_VIEWPORT vp     = { 0.f, 0.f, (float)bd.Width, (float)bd.Height, 0.f, 1.f };
+    D3D12_RECT     rc     = { 0, 0, (LONG)bd.Width, (LONG)bd.Height };
+    D3D12_VIEWPORT vpBase = { 0.f, 0.f, (float)s.baseW, (float)s.baseH, 0.f, 1.f };
+    D3D12_RECT     rcBase = { 0, 0, (LONG)s.baseW, (LONG)s.baseH };
+    list->RSSetViewports(1, &vpBase);       // the blur passes run at the base resolution
+    list->RSSetScissorRects(1, &rcBase);
 
     Transition(s, s.lumaH, D3D12_RESOURCE_STATE_RENDER_TARGET);
     D3D12_CPU_DESCRIPTOR_HANDLE rtvH = RtvCpu(s, 0);
@@ -668,6 +676,8 @@ bool Effect12_Apply(IDXGISwapChain* swap, const DXGI_PRESENT_PARAMETERS* present
     UINT bbSlot = 2 + idx;
     D3D12_CPU_DESCRIPTOR_HANDLE rtvBB = RtvCpu(s, bbSlot);
     s.device->CreateRenderTargetView(bb.Get(), NULL, rtvBB);
+    list->RSSetViewports(1, &vp);
+    list->RSSetScissorRects(1, &rc);
     list->OMSetRenderTargets(1, &rtvBB, FALSE, NULL);
     list->SetPipelineState(s.psoTonemap.Get());
     list->DrawInstanced(3, 1, 0, 0);

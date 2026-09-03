@@ -28,6 +28,46 @@ bool Display_GetRecordedColorSpace(IDXGISwapChain* sc, DXGI_COLOR_SPACE_TYPE* ou
     return true;
 }
 
+// {4C1F9A62-8E3B-4D0A-B7C5-1A2E6F8D9B01}
+static const GUID kDeclaredHdrMetadata =
+    { 0x4c1f9a62, 0x8e3b, 0x4d0a, { 0xb7, 0xc5, 0x1a, 0x2e, 0x6f, 0x8d, 0x9b, 0x01 } };
+
+struct HdrLevels { float peak; float fall; };
+
+// MaxCLL and MaxFALL are whole nits. Mastering luminance is specified in
+// ten-thousandths of a nit, but games have been seen passing whole nits, so
+// both readings are tried and the one that lands in a sane range is kept.
+void Display_RecordHdrMetadata(IDXGISwapChain* sc, DXGI_HDR_METADATA_TYPE type, UINT size, const void* data)
+{
+    if (type != DXGI_HDR_METADATA_TYPE_HDR10 || !data || size < sizeof(DXGI_HDR_METADATA_HDR10))
+    {
+        sc->SetPrivateData(kDeclaredHdrMetadata, 0, NULL);
+        return;
+    }
+    const DXGI_HDR_METADATA_HDR10* m = (const DXGI_HDR_METADATA_HDR10*)data;
+    HdrLevels lv = { 0.0f, 0.0f };
+    if (m->MaxContentLightLevel > 0) lv.peak = (float)m->MaxContentLightLevel;
+    else
+    {
+        float tenThousandths = (float)m->MaxMasteringLuminance / 10000.0f;
+        float whole          = (float)m->MaxMasteringLuminance;
+        if (tenThousandths >= 50.0f && tenThousandths <= 10000.0f) lv.peak = tenThousandths;
+        else if (whole >= 50.0f && whole <= 10000.0f)            lv.peak = whole;
+    }
+    lv.fall = (float)m->MaxFrameAverageLightLevel;
+    sc->SetPrivateData(kDeclaredHdrMetadata, sizeof(lv), &lv);
+}
+
+bool Display_GetRecordedHdrMetadata(IDXGISwapChain* sc, float* peakNits, float* fallNits)
+{
+    HdrLevels lv = { 0.0f, 0.0f };
+    UINT n = sizeof(lv);
+    if (FAILED(sc->GetPrivateData(kDeclaredHdrMetadata, &n, &lv)) || n != sizeof(lv) || lv.peak <= 0.0f) return false;
+    *peakNits = lv.peak;
+    *fallNits = lv.fall;
+    return true;
+}
+
 // A chain composed with alpha is an overlay (a UI layer over a video, say), not
 // picture content: tonemapping premultiplied colour is wrong and writing its
 // alpha would blank whatever sits beneath it.

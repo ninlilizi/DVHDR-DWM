@@ -70,6 +70,16 @@ void Config_Load()
     g_knobs.SdrGamma             = IniSdrGamma();
     g_knobs.ProcessSDR           = GetPrivateProfileIntA("Source", "ProcessSDR", 1, g_iniPath);
     g_knobs.LogEnabled           = GetPrivateProfileIntA("Debug",  "Log",        0, g_iniPath);
+    g_knobs.SceneCut             = IniFloat("Temporal",  "SceneCut",      0.06f);
+    g_knobs.Deadband             = IniFloat("Temporal",  "Deadband",      2.0f) * 0.01f;
+    g_knobs.AblWindowS           = IniFloat("Governor",  "AblWindow",     4.0f);
+    g_knobs.FastCeiling          = IniFloat("Governor",  "FastCeiling",   150.0f) * 0.01f;
+    g_knobs.LiftMetric           = GetPrivateProfileIntA("Governor",    "LiftMetric",    1, g_iniPath);
+    g_knobs.BaseEdgeSigma        = IniFloat("ToneCurve", "BaseEdgeSigma", 0.08f);
+    g_knobs.BaseDownscale        = GetPrivateProfileIntA("Performance", "BaseDownscale", 2, g_iniPath);
+    g_knobs.ShadowDesat          = IniFloat("Color",     "ShadowDesat",   1.0f);
+    g_knobs.GamutClip            = GetPrivateProfileIntA("Color",       "GamutClip",     1, g_iniPath);
+    g_knobs.DitherTemporal       = GetPrivateProfileIntA("Dither",      "Temporal",      1, g_iniPath);
 }
 
 static bool IsSrgbFormat(DXGI_FORMAT fmt)
@@ -196,6 +206,9 @@ bool Config_ClassifySurface(IDXGISwapChain* sc, DXGI_FORMAT fmt, SurfaceInfo* ou
         out->SdrGamma     = ResolveSdrGamma(fmt, ds);
         out->SdrSteps     = StepsForFormat(fmt);
     }
+
+    float peak = 0.0f, fall = 0.0f;
+    if (Display_GetRecordedHdrMetadata(sc, &peak, &fall)) out->ContentPeak = peak;
     return true;
 }
 
@@ -203,11 +216,13 @@ void Config_DescribeSurface(const SurfaceInfo& surf, char* buf, size_t n)
 {
     if (surf.ColorSpace == CSP_SDR)
         snprintf(buf, n, "applied: SDR white=%.0f gamma=%.2f steps=%.0f", surf.SdrWhiteNits, surf.SdrGamma, surf.SdrSteps);
+    else if (surf.ContentPeak > 0.0f)
+        snprintf(buf, n, "applied: %s, content peak %.0f nits", (surf.ColorSpace == CSP_HDR10) ? "HDR10" : "scRGB", surf.ContentPeak);
     else
         snprintf(buf, n, "applied: %s", (surf.ColorSpace == CSP_HDR10) ? "HDR10" : "scRGB");
 }
 
-void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf, float frameTimeMs)
+void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf, float frameTimeMs, UINT frameIndex)
 {
     cb->BufferW             = w;
     cb->BufferH             = h;
@@ -245,4 +260,16 @@ void Config_FillCbuffer(DvhdrCbGpu* cb, UINT w, UINT h, const SurfaceInfo& surf,
     cb->SdrGamma            = surf.SdrGamma;
     cb->SdrSteps            = surf.SdrSteps;
     cb->PreserveAlpha       = 1u;   // a game's own alpha passes through untouched
+    cb->FrameIndex          = frameIndex;
+    cb->SceneCut            = g_knobs.SceneCut;
+    cb->Deadband            = g_knobs.Deadband;
+    cb->AblWindowS          = g_knobs.AblWindowS;
+    cb->FastCeiling         = g_knobs.FastCeiling;
+    cb->LiftMetric          = (g_knobs.LiftMetric != 0) ? 1u : 0u;
+    cb->BaseEdgeSigma       = g_knobs.BaseEdgeSigma;
+    cb->BaseScale           = (g_knobs.BaseDownscale >= 1) ? (UINT)g_knobs.BaseDownscale : 1u;
+    cb->ShadowDesat         = g_knobs.ShadowDesat;
+    cb->GamutClip           = (g_knobs.GamutClip != 0) ? 1u : 0u;
+    cb->DitherTemporal      = (g_knobs.DitherTemporal != 0) ? 1u : 0u;
+    cb->ContentPeak         = surf.ContentPeak;
 }

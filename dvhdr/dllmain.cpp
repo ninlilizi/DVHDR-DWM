@@ -225,6 +225,7 @@ static void* get_relative_address(void* addr, int operand_offset, int instr_size
 struct PerMonitor
 {
     UINT W, H;
+    UINT baseW, baseH;                        // resolution of the lift base (blur) textures
     ID3D11Texture2D*             sceneTex;    ID3D11ShaderResourceView*   sceneSRV;
     ID3D11Texture2D*             lumaHTex;    ID3D11RenderTargetView*     lumaHRTV;     ID3D11ShaderResourceView* lumaHSRV;
     ID3D11Texture2D*             lumaBlurTex; ID3D11RenderTargetView*     lumaBlurRTV;  ID3D11ShaderResourceView* lumaBlurSRV;
@@ -363,8 +364,15 @@ struct DvhdrKnobs
     float ChromaCorrect;
     float LiftLocality;
     float DebandThreshold, DebandRange;
+    float SceneCut, Deadband, AblWindowS, FastCeiling;
+    int   LiftMetric;
+    float BaseEdgeSigma;
+    int   BaseDownscale;
+    float ShadowDesat;
+    int   GamutClip, DitherTemporal;
 };
 static DvhdrKnobs g_knobs;
+static UINT g_frameIndex = 0;   // walks the temporal dither
 
 // GPU-side cbuffer mirror — layout must match `cbuffer DVHDRCb` in
 // dvhdr_dwm.hlsl (4-float rows, 16-byte aligned).
@@ -397,8 +405,21 @@ struct DvhdrCbGpu
     // opaque FP16 scRGB, so these stay zero here.
     float SdrWhiteNits, SdrGamma, SdrSteps;
     UINT  PreserveAlpha;
+
+    UINT  FrameIndex;
+    float SceneCut, Deadband, AblWindowS;
+
+    float FastCeiling;
+    UINT  LiftMetric;
+    float BaseEdgeSigma;
+    UINT  BaseScale;
+
+    float ShadowDesat;
+    UINT  GamutClip;
+    UINT  DitherTemporal;
+    float ContentPeak;
 };
-static_assert(sizeof(DvhdrCbGpu) == 144, "cbuffer layout drift");
+static_assert(sizeof(DvhdrCbGpu) == 192, "cbuffer layout drift");
 
 static float IniFloat(const char* sec, const char* key, float defVal, const char* path)
 {
@@ -450,6 +471,16 @@ static void LoadKnobsFromIni()
     g_knobs.LiftLocality        = IniFloat("ToneCurve", "LiftLocality",         0.0f,    path);
     g_knobs.DebandThreshold     = IniFloat("Deband",    "Threshold",            3.0f,    path);
     g_knobs.DebandRange         = IniFloat("Deband",    "Range",                16.0f,   path);
+    g_knobs.SceneCut            = IniFloat("Temporal",  "SceneCut",             0.06f,   path);
+    g_knobs.Deadband            = IniFloat("Temporal",  "Deadband",             2.0f,    path) * 0.01f;
+    g_knobs.AblWindowS          = IniFloat("Governor",  "AblWindow",            4.0f,    path);
+    g_knobs.FastCeiling         = IniFloat("Governor",  "FastCeiling",          150.0f,  path) * 0.01f;
+    g_knobs.LiftMetric          = GetPrivateProfileIntA("Governor",  "LiftMetric",          1,        path);
+    g_knobs.BaseEdgeSigma       = IniFloat("ToneCurve", "BaseEdgeSigma",        0.08f,   path);
+    g_knobs.BaseDownscale       = GetPrivateProfileIntA("Performance","BaseDownscale",       2,        path);
+    g_knobs.ShadowDesat         = IniFloat("Color",     "ShadowDesat",          1.0f,    path);
+    g_knobs.GamutClip           = GetPrivateProfileIntA("Color",     "GamutClip",           1,        path);
+    g_knobs.DitherTemporal      = GetPrivateProfileIntA("Dither",    "Temporal",            1,        path);
 }
 
 // Resolve each target's panel capabilities. Defaults come from the global
@@ -636,7 +667,7 @@ static bool EnsureMonitorResources(PerMonitor& pm, UINT W, UINT H)
         }
         {
             D3D11_TEXTURE2D_DESC d = {};
-            d.Width = 1; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;
+            d.Width = 2; d.Height = 1; d.MipLevels = 1; d.ArraySize = 1;   // two texels of adapt state
             d.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
             d.SampleDesc.Count = 1;
             d.Usage = D3D11_USAGE_DEFAULT;
@@ -646,8 +677,8 @@ static bool EnsureMonitorResources(PerMonitor& pm, UINT W, UINT H)
             if (FAILED(g_device->CreateUnorderedAccessView(pm.adaptTex, NULL, &pm.adaptUAV))) return false;
 
             // Seed adapt with zeros so the first-frame snap in CS_Adapt works.
-            float zero[4] = {0,0,0,0};
-            D3D11_BOX box = { 0,0,0, 1,1,1 };
+            float zero[8] = {0,0,0,0,0,0,0,0};
+            D3D11_BOX box = { 0,0,0, 2,1,1 };
             g_context->UpdateSubresource(pm.adaptTex, 0, &box, zero, sizeof(zero), sizeof(zero));
         }
         QueryPerformanceCounter(&pm.qpcLast);
@@ -674,9 +705,13 @@ static bool EnsureMonitorResources(PerMonitor& pm, UINT W, UINT H)
         if (FAILED(g_device->CreateTexture2D(&d, NULL, &pm.sceneTex))) return false;
         if (FAILED(g_device->CreateShaderResourceView(pm.sceneTex, NULL, &pm.sceneSRV))) return false;
     }
+    // The base is low frequency; its textures live at a fraction of the size.
+    UINT scale = (g_knobs.BaseDownscale >= 1) ? (UINT)g_knobs.BaseDownscale : 1u;
+    pm.baseW = (W + scale - 1) / scale;
+    pm.baseH = (H + scale - 1) / scale;
     {
         D3D11_TEXTURE2D_DESC d = {};
-        d.Width = W; d.Height = H; d.MipLevels = 1; d.ArraySize = 1;
+        d.Width = pm.baseW; d.Height = pm.baseH; d.MipLevels = 1; d.ArraySize = 1;
         d.Format = DXGI_FORMAT_R16_FLOAT;
         d.SampleDesc.Count = 1;
         d.Usage = D3D11_USAGE_DEFAULT;
@@ -730,6 +765,18 @@ static void UpdateCbuffer(UINT W, UINT H, const MonitorTarget* tgt, float frameT
     cb.LiftLocality        = g_knobs.LiftLocality;
     cb.DebandThreshold     = g_knobs.DebandThreshold;
     cb.DebandRange         = g_knobs.DebandRange;
+    cb.FrameIndex          = g_frameIndex++;
+    cb.SceneCut            = g_knobs.SceneCut;
+    cb.Deadband            = g_knobs.Deadband;
+    cb.AblWindowS          = g_knobs.AblWindowS;
+    cb.FastCeiling         = g_knobs.FastCeiling;
+    cb.LiftMetric          = (g_knobs.LiftMetric != 0) ? 1u : 0u;
+    cb.BaseEdgeSigma       = g_knobs.BaseEdgeSigma;
+    cb.BaseScale           = (g_knobs.BaseDownscale >= 1) ? (UINT)g_knobs.BaseDownscale : 1u;
+    cb.ShadowDesat         = g_knobs.ShadowDesat;
+    cb.GamutClip           = (g_knobs.GamutClip != 0) ? 1u : 0u;
+    cb.DitherTemporal      = (g_knobs.DitherTemporal != 0) ? 1u : 0u;
+    cb.ContentPeak         = 0.0f;
 
     D3D11_MAPPED_SUBRESOURCE m;
     if (SUCCEEDED(g_context->Map(g_cbuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -807,8 +854,9 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
     g_context->CSSetShaderResources(0, 1, nullCsSrv);
 
     // ---- Raster setup (shared across blur + tonemap) ----
-    D3D11_VIEWPORT vp = { 0.f, 0.f, (float)bbd.Width, (float)bbd.Height, 0.f, 1.f };
-    g_context->RSSetViewports(1, &vp);
+    D3D11_VIEWPORT vp     = { 0.f, 0.f, (float)bbd.Width, (float)bbd.Height, 0.f, 1.f };
+    D3D11_VIEWPORT vpBase = { 0.f, 0.f, (float)pm.baseW, (float)pm.baseH, 0.f, 1.f };
+    g_context->RSSetViewports(1, &vpBase);   // the blur passes run at the base resolution
     g_context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g_context->IASetInputLayout(NULL);
     g_context->VSSetShader(g_vsPost, NULL, 0);
@@ -821,8 +869,8 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
     // at LiftLocality 0. The tonemap re-scissors to each dirty rect below.
     g_context->RSSetState(g_rasterScissor);
     {
-        D3D11_RECT fullScissor = { 0, 0, (LONG)bbd.Width, (LONG)bbd.Height };
-        g_context->RSSetScissorRects(1, &fullScissor);
+        D3D11_RECT baseScissor = { 0, 0, (LONG)pm.baseW, (LONG)pm.baseH };
+        g_context->RSSetScissorRects(1, &baseScissor);
     }
 
     ID3D11ShaderResourceView* nullSrvs[5] = { NULL, NULL, NULL, NULL, NULL };
@@ -837,6 +885,7 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
     // ---- PS_BlurV → LumaBlur ----
     g_context->OMSetRenderTargets(0, NULL, NULL);
     g_context->PSSetShaderResources(0, 5, nullSrvs);
+    g_context->PSSetShaderResources(0, 1, &pm.sceneSRV);   // the edge term reads the source luma
     g_context->PSSetShaderResources(3, 1, &pm.lumaHSRV);
     g_context->OMSetRenderTargets(1, &pm.lumaBlurRTV, NULL);
     g_context->PSSetShader(g_psBlurV, NULL, 0);
@@ -852,6 +901,7 @@ static bool RunPipeline(ID3D11Texture2D* backBuffer, const RECT* rects, int numR
     g_context->OMSetRenderTargets(1, &bbRTV, NULL);
     g_context->PSSetShader(g_psTonemap, NULL, 0);
     g_context->RSSetState(g_rasterScissor);
+    g_context->RSSetViewports(1, &vp);
     for (int i = 0; i < numRects; i++)
     {
         D3D11_RECT sr = { rects[i].left, rects[i].top, rects[i].right, rects[i].bottom };
