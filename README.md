@@ -27,7 +27,13 @@ Three binaries:
   `dvhdr.ini`) and the output is held below that white. Every opaque swap chain
   in the process gets its own state (a video player's picture chain beside its
   UI toolkit's chain, on separate devices and threads); transparent overlay
-  chains are passed through. Built by the
+  chains are passed through. Partial presentation (Chromium's dirty-rectangle
+  presents) is handled by keeping the untonemapped page across presents and
+  presenting whole frames. In a browser only the GPU process is hooked, and a
+  video riding a YUV hardware overlay is beyond reach: launch Chrome with
+  `--direct-composition-video-swap-chain-format=bgra` so SDR video overlays
+  become RGB chains the proxy can treat (HDR video already uses RGB10A2), or
+  `--disable-direct-composition` to fold video into the page chain. Built by the
   `dvhdrproxy` project; the shader source (`dvhdr_dwm.hlsl`) is shared with the
   DWM payload, so both stay in step.
 
